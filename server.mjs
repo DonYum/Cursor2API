@@ -1,0 +1,495 @@
+#!/usr/bin/env node
+/**
+ * cursor2api local server CLI — cross-platform replacement for *.ps1 helpers.
+ *
+ *   node server.mjs start [--port 6718] [--foreground]
+ *   node server.mjs stop
+ *   node server.mjs status
+ *   node server.mjs models [--json] [--port 6718]
+ *   node server.mjs claude [--port 6718] [-- ...claude args]
+ *   node server.mjs codex [--port 6718] [--profile NAME] [-- ...codex args]
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { createServer } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+const DEFAULT_PORT = 6718;
+const RUNTIME_DIR = path.join(os.homedir(), ".cursor2api");
+const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
+const BRIDGE_SCRIPT = path.join(repoRoot, "scripts", "cursor-sdk-local-agent-bridge.mjs");
+const SIDECAR_SCRIPT = path.join(repoRoot, "sidecar", "server.ts");
+
+function usage() {
+  console.log(`cursor2api local server
+
+Usage:
+  node server.mjs start [--port PORT] [--host HOST] [--foreground]
+  node server.mjs stop
+  node server.mjs status
+  node server.mjs models [--json] [--port PORT]
+  node server.mjs claude [--port PORT] [-- ...args]
+  node server.mjs codex [--port PORT] [--profile NAME] [-- ...args]
+
+Environment:
+  CURSOR_API_KEY   Cursor Dashboard API key (crsr_…), required for models/claude/codex
+
+Defaults:
+  port=${DEFAULT_PORT}  host=127.0.0.1  runtime=${RUNTIME_DIR}
+`);
+}
+
+function parseArgs(argv) {
+  const args = [...argv];
+  const positional = [];
+  const flags = {};
+
+  while (args.length > 0) {
+    const token = args[0];
+    if (token === "--") {
+      args.shift();
+      positional.push(...args);
+      break;
+    }
+    if (token.startsWith("--")) {
+      const key = token.slice(2);
+      if (key.includes("=")) {
+        const [name, value] = key.split("=", 2);
+        flags[name] = value;
+        args.shift();
+        continue;
+      }
+      const next = args[1];
+      if (next && !next.startsWith("-")) {
+        flags[key] = next;
+        args.shift();
+        args.shift();
+        continue;
+      }
+      flags[key] = true;
+      args.shift();
+      continue;
+    }
+    positional.push(token);
+    args.shift();
+  }
+
+  return { positional, flags };
+}
+
+function requireCommand(flags) {
+  return Number.parseInt(String(flags.port ?? DEFAULT_PORT), 10);
+}
+
+function requireHost(flags) {
+  return String(flags.host ?? "127.0.0.1").trim() || "127.0.0.1";
+}
+
+function readState() {
+  if (!existsSync(STATE_PATH)) return null;
+  try {
+    return JSON.parse(readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeState(state) {
+  mkdirSync(RUNTIME_DIR, { recursive: true });
+  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+}
+
+function clearState() {
+  if (existsSync(STATE_PATH)) rmSync(STATE_PATH, { force: true });
+}
+
+function commandExists(name) {
+  const probe = process.platform === "win32" ? "where" : "which";
+  const result = spawnSync(probe, [name], { stdio: "ignore" });
+  return result.status === 0;
+}
+
+function resolveExecutable(name) {
+  if (!commandExists(name)) {
+    throw new Error(`Required executable not found on PATH: ${name}`);
+  }
+  return name;
+}
+
+function assertDependencies() {
+  if (!existsSync(path.join(repoRoot, "node_modules", "@cursor", "sdk"))) {
+    throw new Error(`Dependencies missing. Run 'npm ci' in ${repoRoot} first.`);
+  }
+  resolveExecutable("node");
+  resolveExecutable("bun");
+}
+
+function getFreePort(startPort, host = "127.0.0.1") {
+  const end = Math.min(startPort + 99, 65535);
+  return new Promise((resolve, reject) => {
+    const tryPort = (port) => {
+      if (port > end) {
+        reject(new Error(`No free port found from ${startPort}.`));
+        return;
+      }
+      const server = createServer();
+      server.unref();
+      server.on("error", () => tryPort(port + 1));
+      server.listen({ port, host }, () => {
+        const chosen = server.address()?.port;
+        server.close(() => resolve(chosen ?? port));
+      });
+    };
+    tryPort(startPort);
+  });
+}
+
+async function fetchHealth(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForHealth(url, { pid, timeoutMs = 30_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pid && !isProcessAlive(pid)) {
+      throw new Error(`Process ${pid} exited before ${url} became healthy.`);
+    }
+    const health = await fetchHealth(url);
+    if (health) return health;
+    await sleep(300);
+  }
+  throw new Error(`Timed out waiting for ${url}.`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProcessAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcess(pid) {
+  if (!pid || !isProcessAlive(pid)) return false;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function spawnLogged(name, command, args, env, logPaths, detached) {
+  mkdirSync(RUNTIME_DIR, { recursive: true });
+  const stdout = createWriteStream(logPaths.stdout, { flags: "w" });
+  const stderr = createWriteStream(logPaths.stderr, { flags: "w" });
+  const child = spawn(command, args, {
+    cwd: repoRoot,
+    env: { ...process.env, ...env },
+    detached: Boolean(detached),
+    stdio: detached ? ["ignore", stdout, stderr] : "inherit"
+  });
+  if (detached) {
+    child.unref();
+    stdout.unref();
+    stderr.unref();
+  }
+  if (!child.pid) {
+    throw new Error(`Failed to start ${name}.`);
+  }
+  return child;
+}
+
+async function cmdStart(flags) {
+  assertDependencies();
+  const port = requireCommand(flags);
+  const host = requireHost(flags);
+  const foreground = Boolean(flags.foreground);
+
+  const existing = await fetchHealth(`http://${host}:${port}/health`);
+  if (existing?.service === "api-for-cursor") {
+    console.log(JSON.stringify({
+      status: "already_running",
+      baseUrl: existing.baseUrl ?? `http://${host}:${port}/v1`,
+      anthropicBaseUrl: `http://${host}:${port}`
+    }));
+    return;
+  }
+
+  if (existing) {
+    throw new Error(`Port ${port} is already in use by another service.`);
+  }
+
+  const bridgePort = await getFreePort(port + 1, host);
+  const bridgeToken = cryptoRandomHex(16);
+  const bridgeEnv = {
+    CURSOR_SDK_BRIDGE_HOST: host,
+    CURSOR_SDK_BRIDGE_PORT: String(bridgePort),
+    CURSOR_SDK_BRIDGE_TOKEN: bridgeToken,
+    CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS: "180000"
+  };
+
+  const bridge = spawnLogged(
+    "bridge",
+    "node",
+    [BRIDGE_SCRIPT],
+    bridgeEnv,
+    {
+      stdout: path.join(RUNTIME_DIR, "bridge.stdout.log"),
+      stderr: path.join(RUNTIME_DIR, "bridge.stderr.log")
+    },
+    !foreground
+  );
+
+  await waitForHealth(`http://${host}:${bridgePort}/health`, {
+    pid: bridge.pid,
+    timeoutMs: 30_000
+  });
+
+  const sidecarEnv = {
+    HOST: host,
+    PORT: String(port),
+    CURSOR_SDK_BRIDGE_URL: `http://${host}:${bridgePort}/sdk`,
+    CURSOR_SDK_BRIDGE_TOKEN: bridgeToken
+  };
+
+  const sidecar = spawnLogged(
+    "sidecar",
+    "bun",
+    ["run", SIDECAR_SCRIPT],
+    sidecarEnv,
+    {
+      stdout: path.join(RUNTIME_DIR, "server.stdout.log"),
+      stderr: path.join(RUNTIME_DIR, "server.stderr.log")
+    },
+    !foreground
+  );
+
+  const health = await waitForHealth(`http://${host}:${port}/health`, {
+    pid: sidecar.pid,
+    timeoutMs: 30_000
+  });
+
+  writeState({
+    port,
+    host,
+    bridgePort,
+    bridgePid: bridge.pid,
+    serverPid: sidecar.pid,
+    startedAt: new Date().toISOString()
+  });
+
+  const summary = {
+    status: "started",
+    baseUrl: health.baseUrl ?? `http://${host}:${port}/v1`,
+    anthropicBaseUrl: `http://${host}:${port}`,
+    serverPid: sidecar.pid,
+    bridgePid: bridge.pid
+  };
+
+  if (foreground) {
+    console.log(JSON.stringify(summary, null, 2));
+    console.error("\nPress Ctrl+C to stop both processes.\n");
+    const shutdown = () => {
+      killProcess(sidecar.pid);
+      killProcess(bridge.pid);
+      clearState();
+      process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    await new Promise(() => {});
+    return;
+  }
+
+  console.log(JSON.stringify(summary));
+}
+
+function cmdStop() {
+  const state = readState();
+  if (!state) {
+    console.log(JSON.stringify({ status: "not_running" }));
+    return;
+  }
+
+  const stopped = [];
+  for (const pid of [state.serverPid, state.bridgePid]) {
+    if (killProcess(pid)) stopped.push(pid);
+  }
+  clearState();
+  console.log(JSON.stringify({ status: "stopped", processIds: stopped }));
+}
+
+async function cmdStatus(flags) {
+  const port = requireCommand(flags);
+  const host = requireHost(flags);
+  const state = readState();
+  const health = await fetchHealth(`http://${host}:${port}/health`);
+
+  console.log(JSON.stringify({
+    state,
+    health,
+    running: health?.service === "api-for-cursor"
+  }, null, 2));
+}
+
+function requireApiKey() {
+  const key = (process.env.CURSOR_API_KEY || "").trim();
+  if (!key) {
+    throw new Error("Set CURSOR_API_KEY to your Cursor Dashboard API key first.");
+  }
+  return key;
+}
+
+async function cmdModels(flags) {
+  const port = requireCommand(flags);
+  const host = requireHost(flags);
+  const apiKey = requireApiKey();
+  const response = await fetch(`http://${host}:${port}/v1/models`, {
+    headers: { Authorization: `Bearer ${apiKey}` }
+  });
+  if (!response.ok) {
+    throw new Error(`GET /v1/models failed: ${response.status} ${response.statusText}`);
+  }
+  const body = await response.json();
+  if (flags.json) {
+    console.log(JSON.stringify(body, null, 2));
+    return;
+  }
+
+  const rows = (body.data ?? []).map((model) => {
+    const parameters = (model.cursor_parameters ?? [])
+      .map((item) => `${item.id}=[${(item.values?.value ?? []).join("|")}]`)
+      .join("; ");
+    const selected = (model.cursor_params ?? [])
+      .map((item) => `${item.id}=${item.value}`)
+      .join(", ");
+    return { id: model.id, name: model.name, parameters, selected };
+  });
+
+  if (rows.length === 0) {
+    console.log("No models returned.");
+    return;
+  }
+
+  const widths = {
+    id: Math.max(2, ...rows.map((row) => row.id.length)),
+    name: Math.max(4, ...rows.map((row) => row.name.length))
+  };
+  console.log(
+    `${"ID".padEnd(widths.id)}  ${"NAME".padEnd(widths.name)}  PARAMETERS`
+  );
+  for (const row of rows) {
+    console.log(
+      `${row.id.padEnd(widths.id)}  ${row.name.padEnd(widths.name)}  ${row.parameters}${row.selected ? `  (${row.selected})` : ""}`
+    );
+  }
+}
+
+function spawnClient(command, args, env) {
+  const child = spawn(command, args, {
+    stdio: "inherit",
+    env: { ...process.env, ...env },
+    shell: process.platform === "win32"
+  });
+  child.on("exit", (code, signal) => {
+    process.exit(code ?? (signal ? 1 : 0));
+  });
+}
+
+function cmdClaude(flags, rest) {
+  requireApiKey();
+  const port = requireCommand(flags);
+  const host = requireHost(flags);
+  spawnClient("claude", rest, {
+    ANTHROPIC_BASE_URL: `http://${host}:${port}`,
+    ANTHROPIC_API_KEY: process.env.CURSOR_API_KEY
+  });
+}
+
+function cmdCodex(flags, rest) {
+  const apiKey = requireApiKey();
+  const profile = String(flags.profile ?? "cursor6718");
+  spawnClient("codex", ["-p", profile, ...rest], {
+    CODEX_API_KEY: apiKey
+  });
+}
+
+function cryptoRandomHex(bytes) {
+  const buffer = new Uint8Array(bytes);
+  crypto.getRandomValues(buffer);
+  return [...buffer].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function main() {
+  const { positional, flags } = parseArgs(process.argv.slice(2));
+  const command = positional[0];
+
+  if (!command || command === "help" || flags.help) {
+    usage();
+    process.exit(command ? 0 : 1);
+  }
+
+  const rest = positional.slice(1);
+
+  switch (command) {
+    case "start":
+      await cmdStart(flags);
+      break;
+    case "stop":
+      cmdStop();
+      break;
+    case "status":
+      await cmdStatus(flags);
+      break;
+    case "models":
+      await cmdModels(flags);
+      break;
+    case "claude":
+      cmdClaude(flags, rest);
+      break;
+    case "codex":
+      cmdCodex(flags, rest);
+      break;
+    default:
+      console.error(`Unknown command: ${command}\n`);
+      usage();
+      process.exit(1);
+  }
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
