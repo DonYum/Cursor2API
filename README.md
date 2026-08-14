@@ -431,6 +431,7 @@ npm run test:sidecar   # 或 cd sidecar && bun test
 
 Powered by [`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk) 与 Cursor Composer 模型。
 
+[LINUX DO](https://linux.do/)提供的交流社区
 ## License
 
 [MIT](LICENSE)
