@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resetCursorSdkSessionCacheForTest } from "./cursor-sdk";
 import { handleRequest } from "./index";
+import { resetModelRouterStateForTest } from "./model-router";
 import { FakeD1, fakeCtx } from "./test-helpers";
 import type { Deps, Env } from "./types";
 
@@ -1706,6 +1707,220 @@ describe("Worker", () => {
     expect(body).toContain("Too many computers used within the last 24 hours");
   });
 
+  it("intersects gateway models, retries billing failures, and disables only that key model", async () => {
+    resetModelRouterStateForTest();
+    const db = new FakeD1();
+    const env = makeEnv(db);
+    const base = fakeDeps();
+    const baseFetch = base.deps.fetch;
+    const chatTokens: string[] = [];
+    base.deps.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init?.headers).get("authorization") || "";
+      if (url.pathname === "/v1/models") {
+        const extra = auth.includes("cursor_route_a") ? "gpt-5.3-codex" : "claude-4.6-sonnet";
+        return Response.json({ items: [
+          { id: "composer-2.5", displayName: "Composer 2.5", aliases: ["default"] },
+          { id: extra, displayName: extra, aliases: [] }
+        ] });
+      }
+      if (url.pathname === "/auth/exchange_user_api_key") {
+        return Response.json({ accessToken: `token:${auth.replace(/^Bearer /, "")}` });
+      }
+      if (url.pathname === "/test-cursor-chat") {
+        chatTokens.push(auth);
+        if (auth === "Bearer token:cursor_route_a") {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(connectFrame(cursorError("Usage unavailable", "Spending limit reached for this model"), 2));
+                controller.close();
+              }
+            }),
+            { headers: { "content-type": "application/connect+proto" } }
+          );
+        }
+      }
+      return baseFetch(input, init);
+    };
+
+    const signup = await handleRequest(new Request("https://composer.test/api/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursorApiKey: "cursor_route_a" })
+    }), env, fakeCtx(), base.deps);
+    const gateway = (await signup.json()) as { apiKey: string };
+    const added = await handleRequest(new Request("https://composer.test/api/credentials", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gateway.apiKey}` },
+      body: JSON.stringify({ cursorApiKey: "cursor_route_b", label: "backup" })
+    }), env, fakeCtx(), base.deps);
+    expect(added.status).toBe(201);
+
+    const models = await handleRequest(new Request("https://composer.test/v1/models", {
+      headers: { authorization: `Bearer ${gateway.apiKey}` }
+    }), env, fakeCtx(), base.deps);
+    const modelBody = (await models.json()) as { data: Array<{ id: string }> };
+    expect(modelBody.data.map((model) => model.id)).toEqual(["default", "composer-2.5"]);
+
+    const completion = await handleRequest(new Request("https://composer.test/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${gateway.apiKey}`,
+        "x-session-affinity": "first"
+      },
+      body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content: "Say hello" }] })
+    }), env, fakeCtx(), base.deps);
+    expect(completion.status).toBe(200);
+    await expect(completion.json()).resolves.toMatchObject({ choices: [{ message: { content: "Hello from Composer" } }] });
+    expect(chatTokens).toEqual(["Bearer token:cursor_route_a", "Bearer token:cursor_route_b"]);
+    expect([...db.cursorCredentialModels.values()]).toEqual([
+      expect.objectContaining({ model_id: "composer-2.5", disabled_reason: expect.stringContaining("Spending limit") })
+    ]);
+
+    chatTokens.length = 0;
+    const next = await handleRequest(new Request("https://composer.test/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gateway.apiKey}`, "x-session-affinity": "first" },
+      body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content: "Say hello" }] })
+    }), env, fakeCtx(), base.deps);
+    expect(next.status).toBe(200);
+    await next.json();
+    expect(chatTokens).toEqual(["Bearer token:cursor_route_b"]);
+  });
+
+  it("lazily migrates a legacy account key into the multi-key credential pool", async () => {
+    resetModelRouterStateForTest();
+    const db = new FakeD1();
+    const env = makeEnv(db);
+    const { deps } = fakeDeps();
+    const signup = await handleRequest(new Request("https://composer.test/api/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursorApiKey: "cursor_legacy_migration" })
+    }), env, fakeCtx(), deps);
+    const gateway = (await signup.json()) as { apiKey: string };
+    db.cursorCredentials.clear();
+
+    const response = await handleRequest(new Request("https://composer.test/v1/models", {
+      headers: { authorization: `Bearer ${gateway.apiKey}` }
+    }), env, fakeCtx(), deps);
+
+    expect(response.status).toBe(200);
+    expect(db.cursorCredentials.size).toBe(1);
+    expect([...db.cursorCredentials.values()][0]).toMatchObject({ label: "default", status: "active" });
+  });
+
+  it("does not permanently disable a model for a recoverable Cursor failure", async () => {
+    resetModelRouterStateForTest();
+    const db = new FakeD1();
+    const env = makeEnv(db);
+    const { deps } = fakeDeps();
+    const signup = await handleRequest(new Request("https://composer.test/api/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursorApiKey: "cursor_transient_key" })
+    }), env, fakeCtx(), deps);
+    const gateway = (await signup.json()) as { apiKey: string };
+
+    const response = await handleRequest(new Request("https://composer.test/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gateway.apiKey}` },
+      body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content: "Trigger Cursor error" }] })
+    }), env, fakeCtx(), deps);
+
+    expect(response.status).toBe(502);
+    expect(db.cursorCredentialModels.size).toBe(0);
+  });
+
+  it("persists billing model disablement when the error arrives inside a stream", async () => {
+    resetModelRouterStateForTest();
+    const db = new FakeD1();
+    const env = makeEnv(db);
+    const base = fakeDeps();
+    const baseFetch = base.deps.fetch;
+    base.deps.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/auth/exchange_user_api_key") return Response.json({ accessToken: "stream-billing-token" });
+      if (url.pathname === "/test-cursor-chat") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(connectFrame(cursorError("Credits exhausted", "Insufficient credit for composer-2.5"), 2));
+              controller.close();
+            }
+          }),
+          { headers: { "content-type": "application/connect+proto" } }
+        );
+      }
+      return baseFetch(input, init);
+    };
+    const signup = await handleRequest(new Request("https://composer.test/api/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursorApiKey: "cursor_stream_billing" })
+    }), env, fakeCtx(), base.deps);
+    const gateway = (await signup.json()) as { apiKey: string };
+
+    const response = await handleRequest(new Request("https://composer.test/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gateway.apiKey}` },
+      body: JSON.stringify({ model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Say hello" }] })
+    }), env, fakeCtx(), base.deps);
+    const body = await response.text();
+
+    expect(body).toContain("event: error");
+    expect(body).toContain("Insufficient credit");
+    expect([...db.cursorCredentialModels.values()]).toEqual([
+      expect.objectContaining({ model_id: "composer-2.5", disabled_reason: expect.stringContaining("Insufficient credit") })
+    ]);
+  });
+
+  it("keeps credential management isolated by gateway account", async () => {
+    resetModelRouterStateForTest();
+    const db = new FakeD1();
+    const env = makeEnv(db);
+    const base = fakeDeps();
+    const baseFetch = base.deps.fetch;
+    base.deps.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init?.headers).get("authorization") || "";
+      if (url.pathname === "/v1/me") {
+        const owner = auth.includes("owner_b") ? 222 : 111;
+        return Response.json({ apiKeyName: "owner", userId: owner, userEmail: `${owner}@example.com`, createdAt: "2026-05-20T00:00:00.000Z" });
+      }
+      return baseFetch(input, init);
+    };
+    const signup = async (cursorApiKey: string): Promise<string> => {
+      const response = await handleRequest(new Request("https://composer.test/api/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cursorApiKey })
+      }), env, fakeCtx(), base.deps);
+      return ((await response.json()) as { apiKey: string }).apiKey;
+    };
+    const ownerA = await signup("owner_a_primary");
+    const ownerB = await signup("owner_b_primary");
+    const added = await handleRequest(new Request("https://composer.test/api/credentials", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ownerA}` },
+      body: JSON.stringify({ cursorApiKey: "owner_a_backup", label: "backup" })
+    }), env, fakeCtx(), base.deps);
+    const addedBody = (await added.json()) as { id: string };
+
+    const listA = await handleRequest(new Request("https://composer.test/api/credentials", { headers: { authorization: `Bearer ${ownerA}` } }), env, fakeCtx(), base.deps);
+    const listB = await handleRequest(new Request("https://composer.test/api/credentials", { headers: { authorization: `Bearer ${ownerB}` } }), env, fakeCtx(), base.deps);
+    expect(((await listA.json()) as { data: unknown[] }).data).toHaveLength(2);
+    expect(((await listB.json()) as { data: unknown[] }).data).toHaveLength(1);
+
+    const foreignDelete = await handleRequest(new Request(`https://composer.test/api/credentials/${addedBody.id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${ownerB}` }
+    }), env, fakeCtx(), base.deps);
+    expect(foreignDelete.status).toBe(404);
+  });
+
   it("requires a bearer token for /v1/models", async () => {
     const db = new FakeD1();
     const env = makeEnv(db);
@@ -1795,6 +2010,12 @@ function fakeDeps(overrides: Partial<Deps> = {}): {
           userLastName: "Lovelace",
           createdAt: "2026-05-20T00:00:00.000Z"
         });
+      }
+      if (url.pathname === "/v1/models") {
+        return Response.json({ items: [
+          { id: "composer-2.5", displayName: "Composer 2.5", aliases: ["default"] },
+          { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast", aliases: [] }
+        ] });
       }
       if (url.pathname === "/auth/exchange_user_api_key" && init?.method === "POST") {
         exchangeAuthHeaders.push(auth);

@@ -1,10 +1,12 @@
-import type { AccountRow, ApiKeyRow } from "./types";
+import type { AccountRow, ApiKeyRow, CursorCredentialModelRow, CursorCredentialRow } from "./types";
 
 export class FakeD1 {
   accounts = new Map<string, AccountRow>();
   apiKeys = new Map<string, ApiKeyRow>();
   requestLogs = new Map<string, Record<string, unknown>>();
   sdkSessions = new Map<string, Record<string, unknown>>();
+  cursorCredentials = new Map<string, CursorCredentialRow>();
+  cursorCredentialModels = new Map<string, CursorCredentialModelRow>();
 
   prepare(sql: string) {
     return new FakeStatement(this, sql);
@@ -49,6 +51,42 @@ class FakeStatement {
         created_at: String(createdAt),
         last_used_at: null,
         revoked_at: null
+      });
+    } else if (normalized.startsWith("INSERT INTO cursor_credentials")) {
+      const [id, accountId, keyHash, prefix, label, ciphertext, iv, hint, createdAt, updatedAt] = this.values;
+      const existing = [...this.db.cursorCredentials.values()].find(
+        (row) => row.account_id === String(accountId) && row.key_hash === String(keyHash)
+      );
+      this.db.cursorCredentials.set(existing?.id || String(id), {
+        id: existing?.id || String(id),
+        account_id: String(accountId),
+        key_hash: String(keyHash),
+        prefix: String(prefix),
+        label: String(label),
+        cursor_api_key_ciphertext: String(ciphertext),
+        cursor_api_key_iv: String(iv),
+        cursor_api_key_hint: nullable(hint),
+        status: "active",
+        disabled_reason: null,
+        created_at: existing?.created_at || String(createdAt),
+        updated_at: String(updatedAt)
+      });
+    } else if (normalized.startsWith("UPDATE cursor_credentials SET status")) {
+      const [reason, updatedAt, id] = this.values;
+      const row = this.db.cursorCredentials.get(String(id));
+      if (row) {
+        row.status = "disabled";
+        row.disabled_reason = String(reason);
+        row.updated_at = String(updatedAt);
+      }
+    } else if (normalized.startsWith("INSERT INTO cursor_credential_models")) {
+      const [credentialId, modelId, reason, disabledAt, updatedAt] = this.values;
+      this.db.cursorCredentialModels.set(`${credentialId}:${modelId}`, {
+        credential_id: String(credentialId),
+        model_id: String(modelId),
+        disabled_reason: String(reason),
+        disabled_at: String(disabledAt),
+        updated_at: String(updatedAt)
       });
     } else if (normalized.startsWith("UPDATE api_keys SET last_used_at")) {
       const [lastUsedAt, id] = this.values;
@@ -115,6 +153,27 @@ class FakeStatement {
       return (this.db.sdkSessions.get(String(id)) || null) as T | null;
     }
     return null;
+  }
+
+  async all<T>() {
+    const normalized = this.sql.replace(/\s+/g, " ").trim();
+    if (normalized.startsWith("SELECT * FROM cursor_credentials WHERE account_id")) {
+      const [accountId] = this.values;
+      return {
+        results: [...this.db.cursorCredentials.values()].filter(
+          (row) => row.account_id === String(accountId)
+        ) as T[]
+      };
+    }
+    if (normalized.startsWith("SELECT * FROM cursor_credential_models WHERE credential_id")) {
+      const [credentialId] = this.values;
+      return {
+        results: [...this.db.cursorCredentialModels.values()].filter(
+          (row) => row.credential_id === String(credentialId) && row.disabled_at !== null
+        ) as T[]
+      };
+    }
+    return { results: [] as T[] };
   }
 }
 

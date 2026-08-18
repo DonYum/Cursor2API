@@ -2,7 +2,7 @@
 /**
  * cursor2api local server CLI — cross-platform replacement for *.ps1 helpers.
  *
- *   node server.mjs start [--port 6718] [--foreground]
+ *   node server.mjs start [--port 6718]
  *   node server.mjs stop
  *   node server.mjs status
  *   node server.mjs models [--json] [--port 6718]
@@ -12,9 +12,10 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import {
-  createWriteStream,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   rmSync,
   writeFileSync
@@ -28,6 +29,8 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PORT = 6718;
 const RUNTIME_DIR = path.join(os.homedir(), ".cursor2api");
 const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
+const CONFIG_PATH = path.join(RUNTIME_DIR, "config.json");
+const CLIENT_INDEX = path.join(repoRoot, "dist", "client", "index.html");
 const BRIDGE_SCRIPT = path.join(repoRoot, "scripts", "cursor-sdk-local-agent-bridge.mjs");
 const SIDECAR_SCRIPT = path.join(repoRoot, "sidecar", "server.ts");
 
@@ -35,7 +38,7 @@ function usage() {
   console.log(`cursor2api local server
 
 Usage:
-  node server.mjs start [--port PORT] [--host HOST] [--foreground]
+  node server.mjs start [--port PORT] [--host HOST]
   node server.mjs stop
   node server.mjs status
   node server.mjs models [--json] [--port PORT]
@@ -43,7 +46,10 @@ Usage:
   node server.mjs codex [--port PORT] [--profile NAME] [-- ...args]
 
 Environment:
-  CURSOR_API_KEY   Cursor Dashboard API key (crsr_…), required for models/claude/codex
+  CURSOR_API_KEY    One Cursor Dashboard API key (crsr_…)
+  CURSOR_API_KEYS   Multiple Cursor keys (comma/newline, label=key, or JSON array)
+  ADMIN_PASSWORD    Optional administrator password for the control console
+  CURSOR2API_API_KEY Client sk-... key created in the control console
 
 Defaults:
   port=${DEFAULT_PORT}  host=127.0.0.1  runtime=${RUNTIME_DIR}
@@ -112,6 +118,43 @@ function writeState(state) {
 
 function clearState() {
   if (existsSync(STATE_PATH)) rmSync(STATE_PATH, { force: true });
+}
+
+function readLocalConfig() {
+  if (!existsSync(CONFIG_PATH)) return {};
+  try {
+    return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function ensureLocalConfig() {
+  const config = readLocalConfig();
+  let changed = false;
+  if (!config.encryptionKey) {
+    config.encryptionKey = cryptoRandomHex(32);
+    changed = true;
+  }
+  if (changed) {
+    mkdirSync(RUNTIME_DIR, { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf8", mode: 0o600 });
+  }
+  return config;
+}
+
+function ensureClientAssets() {
+  const windows = process.platform === "win32";
+  const command = windows ? (process.env.ComSpec || "cmd.exe") : "npm";
+  const args = windows ? ["/d", "/s", "/c", "npm run build:client"] : ["run", "build:client"];
+  const result = spawnSync(command, args, {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: process.env
+  });
+  if (result.status !== 0 || !existsSync(CLIENT_INDEX)) {
+    throw new Error("Could not build the local dashboard assets.");
+  }
 }
 
 function commandExists(name) {
@@ -212,19 +255,25 @@ function killProcess(pid) {
 
 function spawnLogged(name, command, args, env, logPaths, detached) {
   mkdirSync(RUNTIME_DIR, { recursive: true });
-  const stdout = createWriteStream(logPaths.stdout, { flags: "w" });
-  const stderr = createWriteStream(logPaths.stderr, { flags: "w" });
-  const child = spawn(command, args, {
-    cwd: repoRoot,
-    env: { ...process.env, ...env },
-    detached: Boolean(detached),
-    stdio: detached ? ["ignore", stdout, stderr] : "inherit"
-  });
-  if (detached) {
-    child.unref();
-    stdout.unref();
-    stderr.unref();
+  // `spawn` accepts file descriptors for stdio, but not fs.WriteStream
+  // instances (the latter throws on Windows before either child starts).
+  // Open the log files synchronously so the descriptors are ready when the
+  // child is created, then release the parent copies immediately afterwards.
+  const logFds = detached
+    ? [openSync(logPaths.stdout, "w"), openSync(logPaths.stderr, "w")]
+    : [];
+  let child;
+  try {
+    child = spawn(command, args, {
+      cwd: repoRoot,
+      env: { ...process.env, ...env },
+      detached: Boolean(detached),
+      stdio: detached ? ["ignore", ...logFds] : "inherit"
+    });
+  } finally {
+    for (const fd of logFds) closeSync(fd);
   }
+  if (detached) child.unref();
   if (!child.pid) {
     throw new Error(`Failed to start ${name}.`);
   }
@@ -233,16 +282,21 @@ function spawnLogged(name, command, args, env, logPaths, detached) {
 
 async function cmdStart(flags) {
   assertDependencies();
+  ensureClientAssets();
+  const localConfig = ensureLocalConfig();
   const port = requireCommand(flags);
   const host = requireHost(flags);
-  const foreground = Boolean(flags.foreground);
+  // Local services stay attached to the invoking terminal. This keeps every
+  // startup entry point consistent and lets Ctrl+C shut down both children.
+  const foreground = true;
 
   const existing = await fetchHealth(`http://${host}:${port}/health`);
   if (existing?.service === "api-for-cursor") {
     console.log(JSON.stringify({
       status: "already_running",
       baseUrl: existing.baseUrl ?? `http://${host}:${port}/v1`,
-      anthropicBaseUrl: `http://${host}:${port}`
+      anthropicBaseUrl: `http://${host}:${port}`,
+      dashboardUrl: `http://${host}:${port}/dashboard`
     }));
     return;
   }
@@ -281,7 +335,13 @@ async function cmdStart(flags) {
     HOST: host,
     PORT: String(port),
     CURSOR_SDK_BRIDGE_URL: `http://${host}:${bridgePort}/sdk`,
-    CURSOR_SDK_BRIDGE_TOKEN: bridgeToken
+    CURSOR_SDK_BRIDGE_TOKEN: bridgeToken,
+    CURSOR_ROUTER_STATE_PATH: path.join(RUNTIME_DIR, "router-state.json"),
+    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || localConfig.encryptionKey,
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
+    LOCAL_AUTH_STATE_PATH: path.join(RUNTIME_DIR, "auth-state.json"),
+    PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
+    STATIC_DIR: path.join(repoRoot, "dist", "client")
   };
 
   const sidecar = spawnLogged(
@@ -314,6 +374,7 @@ async function cmdStart(flags) {
     status: "started",
     baseUrl: health.baseUrl ?? `http://${host}:${port}/v1`,
     anthropicBaseUrl: `http://${host}:${port}`,
+    dashboardUrl: `http://${host}:${port}/dashboard`,
     serverPid: sidecar.pid,
     bridgePid: bridge.pid
   };
@@ -365,10 +426,8 @@ async function cmdStatus(flags) {
 }
 
 function requireApiKey() {
-  const key = (process.env.CURSOR_API_KEY || "").trim();
-  if (!key) {
-    throw new Error("Set CURSOR_API_KEY to your Cursor Dashboard API key first.");
-  }
+  const key = (process.env.CURSOR2API_API_KEY || "").trim();
+  if (!key) throw new Error("Set CURSOR2API_API_KEY to a client sk-... key created in the dashboard.");
   return key;
 }
 
@@ -429,12 +488,12 @@ function spawnClient(command, args, env) {
 }
 
 function cmdClaude(flags, rest) {
-  requireApiKey();
+  const apiKey = requireApiKey();
   const port = requireCommand(flags);
   const host = requireHost(flags);
   spawnClient("claude", rest, {
     ANTHROPIC_BASE_URL: `http://${host}:${port}`,
-    ANTHROPIC_API_KEY: process.env.CURSOR_API_KEY
+    ANTHROPIC_API_KEY: apiKey
   });
 }
 

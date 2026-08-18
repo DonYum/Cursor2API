@@ -59,6 +59,29 @@ export interface ApiKeyRow {
   revoked_at: string | null;
 }
 
+export interface CursorCredentialRow {
+  id: string;
+  account_id: string;
+  key_hash: string;
+  prefix: string;
+  label: string;
+  cursor_api_key_ciphertext: string;
+  cursor_api_key_iv: string;
+  cursor_api_key_hint: string | null;
+  status: "active" | "disabled";
+  disabled_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CursorCredentialModelRow {
+  credential_id: string;
+  model_id: string;
+  disabled_reason: string | null;
+  disabled_at: string | null;
+  updated_at: string;
+}
+
 export interface AuthenticatedAccount {
   account: AccountRow;
   apiKey: ApiKeyRow;

@@ -20,7 +20,7 @@
 
 ## 项目简介
 
-**cursor2api** 是一个轻量级 API 网关，把你的 **Cursor API Key**（`crsr_…`）转成标准 HTTP 接口。客户端只需配置 `baseUrl` + `apiKey`，即可接入 Cursor 上的 Composer、Claude、GPT 等模型，无需为每个工具单独写适配层。
+**cursor2api** 是一个轻量级 API 网关，把一把或多把 **Cursor API Key**（`crsr_…`）转成标准 HTTP 接口。客户端只需配置 `baseUrl` + 网关 `apiKey`，即可接入 Cursor 上的 Composer、Claude、GPT 等模型，无需为每个工具单独写适配层。
 
 与仅支持单一 OpenAI Chat 格式的早期版本不同，**当前版本完整支持三种主流协议**：
 
@@ -105,10 +105,10 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 | :-- | :-- |
 | **接口** | Responses、Chat Completions、Anthropic Messages；流式 SSE + 非流式 JSON |
 | **客户端** | Codex、Claude Code、Cherry Studio，以及 OpenAI / Anthropic 兼容 SDK |
-| **模型** | `GET /v1/models` 动态拉取 Cursor 账号可用模型（Composer、Claude、GPT 等） |
+| **模型** | `GET /v1/models` 动态拉取所有 Cursor Key 的可用模型交集（Composer、Claude、GPT 等） |
 | **工具** | Codex `exec` 等 Responses 工具、Claude Code 读写文件等 Messages 工具，经 SDK Bridge 转发 |
 | **上下文** | Claude Code 1M 上下文（`claude-opus-5[1m]` 或 `anthropic-beta` 头） |
-| **可靠性** | SDK 瞬时断连自动重试（最多 3 次）；Bridge 凭据定期刷新 |
+| **可靠性** | 多 Key 自动路由和账单熔断；SDK 瞬时断连自动重试；Bridge 凭据定期刷新 |
 | **部署** | 本地 sidecar + bridge；可选 Windows Tauri 托盘；Cloudflare Worker |
 
 ### 协议边界
@@ -117,9 +117,9 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 
 | 协议 | 鉴权方式 | 流式 | 工具调用 | 适用场景 |
 | :-- | :-- | :-- | :-- | :-- |
-| **Responses** | `Authorization: Bearer crsr_…` | SSE | ✅ Codex 工具链 | Codex、Cherry Studio（Responses 模式） |
-| **Messages** | `x-api-key: crsr_…` 或 Bearer | SSE | ✅ Claude Code 工具 | Claude Code CLI |
-| **Chat Completions** | `Authorization: Bearer crsr_…` | SSE / JSON | 取决于客户端 | 通用 OpenAI 兼容 Agent |
+| **Responses** | `Authorization: Bearer sk-…` | SSE | ✅ Codex 工具链 | Codex、Cherry Studio（Responses 模式） |
+| **Messages** | `x-api-key: sk-…` 或 Bearer | SSE | ✅ Claude Code 工具 | Claude Code CLI |
+| **Chat Completions** | `Authorization: Bearer sk-…` | SSE / JSON | 取决于客户端 | 通用 OpenAI 兼容 Agent |
 
 ## 快速部署
 
@@ -138,12 +138,9 @@ git clone https://github.com/NGLSG/cursor2api.git
 cd cursor2api
 npm ci   # 或 bun install
 
-# 启动 Sidecar + SDK Bridge（后台）
-node server.mjs start
-# 输出 JSON：baseUrl / anthropicBaseUrl / pid
-
-# 前台运行（调试）
-node server.mjs start --foreground
+# 启动 Sidecar + SDK Bridge（前台，持续输出日志）
+npm run dev
+# 按 Ctrl+C 停止
 
 # 停止
 node server.mjs stop
@@ -152,20 +149,24 @@ node server.mjs stop
 node server.mjs status
 ```
 
-也可使用 npm 脚本：
+`npm run dev`、`start:local` 和 `node server.mjs start` 都启动同一套服务，并持续占用当前终端输出日志：
 
 ```bash
 npm run start:local
 npm run stop:local
 ```
 
+启动后打开 `http://127.0.0.1:6718/dashboard`。首次访问设置管理员密码，随后导入 Cursor Key 并创建客户端使用的独立 `sk-…` API Key。前端、控制台、管理 API 和 `/v1/*` 网关均由 `6718` 端口上的同一个进程提供。
+
 验证服务：
 
 ```bash
 curl http://127.0.0.1:6718/health
-export CURSOR_API_KEY="crsr_YOUR_KEY"
+export CURSOR_API_KEYS="team-a=crsr_KEY_A,team-b=crsr_KEY_B"
+# 在 Dashboard 创建客户端 Key 后设置它
+export CURSOR2API_API_KEY="sk_LOCAL_CLIENT_KEY"
 node server.mjs models
-curl -H "Authorization: Bearer $CURSOR_API_KEY" http://127.0.0.1:6718/v1/models
+curl -H "Authorization: Bearer $CURSOR2API_API_KEY" http://127.0.0.1:6718/v1/models
 ```
 
 <details>
@@ -192,6 +193,7 @@ bun run sidecar/server.ts
 | :-- | :-- |
 | OpenAI 兼容（Codex / Chat） | `http://127.0.0.1:6718/v1` |
 | Anthropic 兼容（Claude Code） | `http://127.0.0.1:6718` |
+| 凭据管理后台 | `http://127.0.0.1:6718/dashboard` |
 | 健康检查 | `http://127.0.0.1:6718/health` |
 
 建议客户端使用 **`127.0.0.1`** 而非 `localhost`，避免 IPv6 解析导致连不上。
@@ -205,6 +207,38 @@ npm run deploy
 ```
 
 **自建 VPS / Linux**：与本地相同，启动 sidecar + bridge 后用 systemd 或 Docker 守护进程即可。
+
+### Docker Compose（预构建镜像）
+
+仓库提供两个容器：预编译的 API Sidecar 和 Node SDK Bridge。默认镜像发布到
+GHCR；如果镜像尚未拉取，Compose 也可以根据仓库中的 Dockerfile 本地构建。
+
+```bash
+cp .env.docker.example .env
+# 编辑 .env，设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
+# Cursor Key 可以预先通过 CURSOR_API_KEY(S) 配置，也可以启动后在 Dashboard 导入
+
+# 使用已发布的预构建镜像
+docker compose pull
+docker compose up
+```
+
+Compose 同样只对外暴露一个 `6718` 端口。打开 `http://127.0.0.1:6718/dashboard`，使用 `.env` 中的 `ADMIN_PASSWORD` 登录即可管理凭据并创建客户端 Key。
+
+`docker compose up` 默认以前台模式运行并持续输出两个容器的日志，按 `Ctrl+C`
+停止。另一个终端可以检查状态：
+
+```bash
+docker compose ps
+curl http://127.0.0.1:6718/health
+```
+
+没有可用的 GHCR 镜像时，直接在仓库目录执行 `docker compose up --build` 即可本地
+编译并启动。停止并清理容器和网络：
+
+```bash
+docker compose down
+```
 
 ## 客户端接入
 
@@ -224,7 +258,7 @@ env_key = "CODEX_API_KEY"
 ```
 
 ```bash
-export CODEX_API_KEY="crsr_YOUR_KEY"
+export CODEX_API_KEY="sk_LOCAL_CLIENT_KEY"
 codex
 
 # 或一键启动（需已配置 codex profile，默认 cursor6718）
@@ -240,11 +274,11 @@ node server.mjs codex --profile cursor6718 -- "你的提示词"
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:6718"
-export ANTHROPIC_API_KEY="crsr_YOUR_KEY"
+export ANTHROPIC_API_KEY="sk_LOCAL_CLIENT_KEY"
 claude
 
 # 或一键启动（自动注入上述环境变量）
-export CURSOR_API_KEY="crsr_YOUR_KEY"
+export CURSOR2API_API_KEY="sk_LOCAL_CLIENT_KEY"
 node server.mjs claude
 node server.mjs claude -- "你的提示词"
 ```
@@ -254,7 +288,7 @@ node server.mjs claude -- "你的提示词"
 | 配置项 | 值 |
 | :-- | :-- |
 | Base URL | `http://127.0.0.1:6718/v1` |
-| API Key | `crsr_…` |
+| API Key | Dashboard 创建的 `sk-…` |
 | Model | 从 `GET /v1/models` 选择 |
 
 ### Cherry Studio
@@ -263,7 +297,7 @@ node server.mjs claude -- "你的提示词"
 | :-- | :-- |
 | Base URL | `http://127.0.0.1:6718/v1` |
 | API 类型 | OpenAI 兼容 / Responses API |
-| API Key | `crsr_…` |
+| API Key | Dashboard 创建的 `sk-…` |
 
 ### 客户端对照表
 
@@ -276,7 +310,9 @@ node server.mjs claude -- "你的提示词"
 
 ## 模型与路由
 
-cursor2api **不使用固定模型清单**。`GET /v1/models` 会实时读取当前 Cursor 账号可用模型，不同账号、订阅等级可能返回不同结果。
+cursor2api **不使用固定模型清单**。单 Key 模式下，`GET /v1/models` 实时读取该 Cursor 账号可用模型；多 Key 网关模式下，它会并行读取每把 Key 的模型目录并仅返回交集。
+
+对话请求根据传入的 `model` 自动选择支持该模型的 Cursor Key。某把 Key 返回账单、额度或余额错误时，网关会将该 Key 的对应模型标记为禁用并切换到下一把 Key；限流、网络和临时 SDK 错误不会形成永久禁用。Docker 的禁用状态保存在 `router-data` 卷，Cloudflare Worker 则保存在 D1。
 
 常见模型示例（以实际 `/v1/models` 返回为准）：
 
@@ -290,16 +326,16 @@ cursor2api **不使用固定模型清单**。`GET /v1/models` 会实时读取当
 
 ## API
 
-推理接口使用 Cursor API Key：
+多 Key 网关模式下，推理接口使用在控制台创建的独立客户端 Key：
 
 ```http
-Authorization: Bearer crsr_YOUR_KEY
+Authorization: Bearer sk_YOUR_CLIENT_KEY
 ```
 
 Anthropic 客户端也可使用：
 
 ```http
-x-api-key: crsr_YOUR_KEY
+x-api-key: sk_YOUR_CLIENT_KEY
 ```
 
 | 方法 | 路径 | 用途 |
@@ -317,7 +353,7 @@ x-api-key: crsr_YOUR_KEY
 
 ```bash
 curl http://127.0.0.1:6718/v1/responses \
-  -H "Authorization: Bearer crsr_YOUR_KEY" \
+  -H "Authorization: Bearer sk_YOUR_CLIENT_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "composer-2.5",
@@ -330,7 +366,7 @@ curl http://127.0.0.1:6718/v1/responses \
 
 ```bash
 curl http://127.0.0.1:6718/v1/messages \
-  -H "x-api-key: crsr_YOUR_KEY" \
+  -H "x-api-key: sk_YOUR_CLIENT_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-opus-5",
@@ -343,7 +379,7 @@ curl http://127.0.0.1:6718/v1/messages \
 
 ```bash
 curl http://127.0.0.1:6718/v1/chat/completions \
-  -H "Authorization: Bearer crsr_YOUR_KEY" \
+  -H "Authorization: Bearer sk_YOUR_CLIENT_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "composer-2.5",
@@ -358,8 +394,8 @@ curl http://127.0.0.1:6718/v1/chat/completions \
 
 | 命令 | 说明 |
 | :-- | :-- |
-| `node server.mjs start [--port 6718] [--foreground]` | 启动 Sidecar + Bridge |
-| `node server.mjs stop` | 停止后台进程 |
+| `node server.mjs start [--port 6718]` | 前台启动 Sidecar + Bridge |
+| `node server.mjs stop` | 停止运行中的进程 |
 | `node server.mjs status` | 查看运行状态 |
 | `node server.mjs models [--json]` | 列出可用模型 |
 | `node server.mjs claude [-- ...]` | 注入 Anthropic 环境变量并启动 Claude Code |
@@ -371,7 +407,13 @@ Sidecar 与 Bridge 通过环境变量配置，参考 [`.env.example`](.env.examp
 | :-- | :-- | :-- |
 | `PORT` | Sidecar 监听端口 | `8787`（脚本默认 `6718`） |
 | `HOST` | 绑定地址 | `127.0.0.1` |
-| `CURSOR_API_KEY` | 默认 Cursor Key（可选，客户端 Bearer 优先） | — |
+| `CURSOR_API_KEY` | 单把 Cursor Key；可与 Key 池合并 | — |
+| `CURSOR_API_KEYS` | 多把 Cursor Key，支持逗号/换行、`label=key` 或 JSON 数组 | — |
+| `ADMIN_PASSWORD` | 控制台管理员密码；Compose 中必填 | — |
+| `PUBLIC_BASE_URL` | 可选的对外网关地址，控制台也可更新 | 请求地址 |
+| `LOCAL_AUTH_STATE_PATH` | 管理员凭据与客户端 Key 的状态文件 | 与路由状态相邻 |
+| `CURSOR2API_API_KEY` | CLI 使用的客户端 `sk-…` Key | — |
+| `CURSOR_ROUTER_STATE_PATH` | Key+模型禁用状态文件 | 内存（Compose 使用数据卷） |
 | `CURSOR_SDK_BRIDGE_URL` | Bridge 地址 | — |
 | `CURSOR_SDK_BRIDGE_TOKEN` | Bridge 鉴权 Token | — |
 | `CURSOR_SDK_BRIDGE_HOST` | Bridge 绑定地址 | `127.0.0.1` |

@@ -5,6 +5,9 @@
   "account_id": "fd9e24c9339e83e73661475690574340",
   "compatibility_date": "2026-05-20",
   "compatibility_flags": ["nodejs_compat"],
+  "dev": {
+    "enable_containers": false
+  },
   "workers_dev": true,
   "routes": [
     { "pattern": "cursor-api.standardagents.ai", "custom_domain": true },

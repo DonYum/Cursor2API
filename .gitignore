@@ -10,6 +10,7 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.docker.example
 .dev.vars
 *.key
 *.key.pub

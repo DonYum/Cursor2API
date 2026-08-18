@@ -1,12 +1,25 @@
 import { accountIdForCursor, apiKeyPrefix, decryptText, encryptText, randomToken, sha256Hex } from "./crypto";
-import type { AccountRow, ApiKeyRow, AuthenticatedAccount, CursorMe, Env } from "./types";
+import type {
+  AccountRow,
+  ApiKeyRow,
+  AuthenticatedAccount,
+  CursorCredentialModelRow,
+  CursorCredentialRow,
+  CursorMe,
+  Env
+} from "./types";
 
 export interface SignupRecord {
   account: AccountRow;
   proxyApiKey: string;
 }
 
-export async function saveSignup(env: Env, cursorApiKey: string, me: CursorMe, input: { joinWaitlist: boolean }): Promise<SignupRecord> {
+export async function saveSignup(
+  env: Env,
+  cursorApiKey: string,
+  me: CursorMe,
+  input: { joinWaitlist: boolean; credentialLabel?: string }
+): Promise<SignupRecord> {
   const secret = requireEncryptionSecret(env);
   const now = new Date().toISOString();
   const cursorUserId = me.userId === undefined ? null : String(me.userId);
@@ -57,6 +70,8 @@ export async function saveSignup(env: Env, cursorApiKey: string, me: CursorMe, i
     )
     .run();
 
+  await saveCursorCredential(env, account.id, cursorApiKey, input.credentialLabel || "default");
+
   const proxyApiKey = randomToken("cmp");
   const keyHash = await sha256Hex(proxyApiKey);
   await env.DB.prepare(
@@ -67,6 +82,112 @@ export async function saveSignup(env: Env, cursorApiKey: string, me: CursorMe, i
     .run();
 
   return { account, proxyApiKey };
+}
+
+export async function saveCursorCredential(
+  env: Env,
+  accountId: string,
+  cursorApiKey: string,
+  label = "Imported"
+): Promise<CursorCredentialRow> {
+  const secret = requireEncryptionSecret(env);
+  const normalizedKey = cursorApiKey.trim();
+  const keyHash = await sha256Hex(normalizedKey);
+  const id = `cred_${(await sha256Hex(`${accountId}:${keyHash}`)).slice(0, 32)}`;
+  const encrypted = await encryptText(normalizedKey, secret);
+  const now = new Date().toISOString();
+  const row: CursorCredentialRow = {
+    id,
+    account_id: accountId,
+    key_hash: keyHash,
+    prefix: apiKeyPrefix(normalizedKey),
+    label: label.trim() || "Imported",
+    cursor_api_key_ciphertext: encrypted.ciphertext,
+    cursor_api_key_iv: encrypted.iv,
+    cursor_api_key_hint: normalizedKey.slice(-4),
+    status: "active",
+    disabled_reason: null,
+    created_at: now,
+    updated_at: now
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO cursor_credentials (
+      id, account_id, key_hash, prefix, label, cursor_api_key_ciphertext,
+      cursor_api_key_iv, cursor_api_key_hint, status, disabled_reason, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)
+    ON CONFLICT(account_id, key_hash) DO UPDATE SET
+      label = excluded.label,
+      cursor_api_key_ciphertext = excluded.cursor_api_key_ciphertext,
+      cursor_api_key_iv = excluded.cursor_api_key_iv,
+      cursor_api_key_hint = excluded.cursor_api_key_hint,
+      status = 'active',
+      disabled_reason = NULL,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      row.id,
+      row.account_id,
+      row.key_hash,
+      row.prefix,
+      row.label,
+      row.cursor_api_key_ciphertext,
+      row.cursor_api_key_iv,
+      row.cursor_api_key_hint,
+      row.created_at,
+      row.updated_at
+    )
+    .run();
+
+  return row;
+}
+
+export async function listCursorCredentials(env: Env, accountId: string): Promise<CursorCredentialRow[]> {
+  const statement = env.DB.prepare(
+    `SELECT * FROM cursor_credentials WHERE account_id = ? ORDER BY created_at ASC`
+  ).bind(accountId) as unknown as { all?: <T>() => Promise<{ results?: T[] }> };
+  if (typeof statement.all !== "function") return [];
+  const result = await statement.all<CursorCredentialRow>();
+  return result.results ?? [];
+}
+
+export async function disableCursorCredential(env: Env, credentialId: string, reason: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE cursor_credentials SET status = 'disabled', disabled_reason = ?, updated_at = ? WHERE id = ?`
+  )
+    .bind(reason.slice(0, 500), new Date().toISOString(), credentialId)
+    .run();
+}
+
+export async function disableCursorCredentialModel(
+  env: Env,
+  credentialId: string,
+  modelId: string,
+  reason: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO cursor_credential_models (credential_id, model_id, disabled_reason, disabled_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(credential_id, model_id) DO UPDATE SET
+       disabled_reason = excluded.disabled_reason,
+       disabled_at = excluded.disabled_at,
+       updated_at = excluded.updated_at`
+  )
+    .bind(credentialId, modelId, reason.slice(0, 500), now, now)
+    .run();
+}
+
+export async function listDisabledCursorCredentialModels(
+  env: Env,
+  credentialId: string
+): Promise<CursorCredentialModelRow[]> {
+  const statement = env.DB.prepare(
+    `SELECT * FROM cursor_credential_models WHERE credential_id = ? AND disabled_at IS NOT NULL`
+  ).bind(credentialId) as unknown as { all?: <T>() => Promise<{ results?: T[] }> };
+  if (typeof statement.all !== "function") return [];
+  const result = await statement.all<CursorCredentialModelRow>();
+  return result.results ?? [];
 }
 
 export async function authenticateProxyKey(env: Env, proxyApiKey: string): Promise<AuthenticatedAccount | null> {

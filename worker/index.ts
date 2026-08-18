@@ -1,7 +1,15 @@
 import { collectCursorOutput, createCursorCompletion, resolveCursorModel, streamCursorText, verifyCursorApiKey } from "./cursor";
 import { collectCursorSdkOutput, createCursorSdkCompletion } from "./cursor-sdk";
 import { sha256Hex } from "./crypto";
-import { authenticateProxyKey, completeRequestLog, createRequestLog, saveSignup } from "./db";
+import {
+  authenticateProxyKey,
+  completeRequestLog,
+  createRequestLog,
+  disableCursorCredential,
+  listCursorCredentials,
+  saveCursorCredential,
+  saveSignup
+} from "./db";
 import { bearerToken, errorResponse, HttpError, json, notFound, openAiError, optionsResponse, parseJsonBody, sseResponse, unauthorized, withCors } from "./http";
 import {
   chatChunk,
@@ -30,6 +38,14 @@ import type { Deps, Env } from "./types";
 import type { CursorTextEvent } from "./cursor";
 import type { ToolCallContext } from "./openai";
 import type { OpenAiToolSpec } from "./openai";
+import {
+  isBillingError,
+  loadRoutedCredentials,
+  markBillingModelDisabled,
+  openAiModelList,
+  routeCandidates,
+  type RoutedCredential
+} from "./model-router";
 
 export { CursorSdkBridgeContainer } from "./sdk-bridge-container";
 
@@ -39,7 +55,7 @@ export { CursorSdkBridgeContainer } from "./sdk-bridge-container";
  * - `direct`: a Cursor API key passed straight through; nothing is stored.
  */
 type AuthResult =
-  | { mode: "proxy"; accountId: string; cursorApiKey: string }
+  | { mode: "proxy"; accountId: string; cursorApiKey: string; credentialId?: string }
   | { mode: "direct"; cursorApiKey: string };
 
 interface StoredResponseState {
@@ -77,6 +93,9 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
     }
     if (url.pathname === "/api/early-access" && request.method === "POST") {
       return await handleEarlyAccess(request, env, deps);
+    }
+    if (url.pathname === "/api/credentials" || url.pathname.startsWith("/api/credentials/")) {
+      return await handleCredentialRoute(request, env, deps, url);
     }
     if (isNotaryWebhookRoute(url.pathname)) {
       return await handleNotaryWebhook(request, env, url, deps);
@@ -347,8 +366,9 @@ async function handleSignup(request: Request, env: Env, ctx: ExecutionContext, d
   const me = await verifyCursorApiKey(env, deps, cursorApiKey);
   const name = typeof body.name === "string" ? body.name.trim() : "";
   const email = typeof body.email === "string" ? body.email.trim() : me.userEmail || "";
+  const credentialLabel = typeof body.label === "string" ? body.label.trim() : "";
   const joinWaitlist = body.joinWaitlist === true;
-  const signup = await saveSignup(env, cursorApiKey, me, { joinWaitlist });
+  const signup = await saveSignup(env, cursorApiKey, me, { joinWaitlist, credentialLabel });
   if (joinWaitlist) {
     ctx.waitUntil(
       submitWaitlist(env, deps, {
@@ -378,6 +398,71 @@ async function handleSignup(request: Request, env: Env, ctx: ExecutionContext, d
   });
 }
 
+async function handleCredentialRoute(request: Request, env: Env, deps: Deps, url: URL): Promise<Response> {
+  const token = bearerToken(request);
+  if (!token?.startsWith("cmp_")) return unauthorized();
+  const auth = await authenticateProxyKey(env, token);
+  if (!auth) return unauthorized();
+
+  const credentialId = url.pathname.startsWith("/api/credentials/")
+    ? decodeURIComponent(url.pathname.slice("/api/credentials/".length))
+    : "";
+
+  if (request.method === "GET" && !credentialId) {
+    const credentials = await loadRoutedCredentials(env, deps, {
+      accountId: auth.account.id,
+      fallbackApiKey: auth.cursorApiKey
+    });
+    const rows = await listCursorCredentials(env, auth.account.id);
+    const activeById = new Map(credentials.map((credential) => [credential.id, credential]));
+    return json({
+      data: rows.map((row) => {
+        const credential = activeById.get(row.id);
+        return {
+          id: row.id,
+          label: row.label,
+          hint: row.cursor_api_key_hint || row.prefix,
+          status: row.status,
+          disabledReason: row.disabled_reason,
+          models: credential ? intersectModelIds(credential.models, credential.disabledModels) : [],
+          disabledModels: credential ? [...credential.disabledModels] : []
+        };
+      })
+    });
+  }
+
+  if (request.method === "POST" && !credentialId) {
+    const body = await parseJsonBody<Record<string, unknown>>(request);
+    const cursorApiKey = typeof body.cursorApiKey === "string" ? body.cursorApiKey.trim() : "";
+    if (!cursorApiKey) throw new HttpError("Cursor API key is required", 400, "invalid_request_error", "cursorApiKey");
+    const me = await verifyCursorApiKey(env, deps, cursorApiKey);
+    const row = await saveCursorCredential(env, auth.account.id, cursorApiKey, typeof body.label === "string" ? body.label : "Imported");
+    const credentials = await loadRoutedCredentials(env, deps, { accountId: auth.account.id, fallbackApiKey: auth.cursorApiKey });
+    const created = credentials.find((credential) => credential.id === row.id);
+    return json({
+      id: row.id,
+      label: row.label,
+      hint: row.cursor_api_key_hint,
+      cursorEmail: me.userEmail || null,
+      models: created ? intersectModelIds(created.models, created.disabledModels) : [],
+      disabledModels: created ? [...created.disabledModels] : []
+    }, { status: 201 });
+  }
+
+  if (request.method === "DELETE" && credentialId) {
+    const credentials = await loadRoutedCredentials(env, deps, { accountId: auth.account.id, fallbackApiKey: auth.cursorApiKey });
+    if (!credentials.some((credential) => credential.id === credentialId)) return notFound();
+    await disableCursorCredential(env, credentialId, "disabled by account owner");
+    return json({ id: credentialId, disabled: true });
+  }
+
+  return notFound();
+}
+
+function intersectModelIds(models: Array<{ id: string }>, disabled: Set<string>): string[] {
+  return models.map((model) => model.id).filter((id) => !disabled.has(id));
+}
+
 async function handleOpenAiRoute(
   request: Request,
   env: Env,
@@ -385,30 +470,87 @@ async function handleOpenAiRoute(
   deps: Deps,
   route: OpenAiRoute
 ): Promise<Response> {
+  const auth = await authenticate(request, env, route);
+  if (!auth) return unauthorized();
+
   if (route.kind === "models") {
-    const auth = await authenticate(request, env, route);
-    if (!auth) return unauthorized();
     if (request.method !== "GET") return notFound();
+    if (auth.mode === "proxy") {
+      const credentials = await loadRoutedCredentials(env, deps, {
+        accountId: auth.accountId,
+        fallbackApiKey: auth.cursorApiKey
+      });
+      return json(openAiModelList(credentials, {
+        opencode: route.surface === "opencode" || route.surface === "opencodev2",
+        sdk: route.surface === "opencodev2"
+      }));
+    }
     return json(modelList({ opencode: route.surface === "opencode" || route.surface === "opencodev2", sdk: route.surface === "opencodev2" }));
   }
 
   if (route.kind === "response" || route.kind === "responseInputItems" || route.kind === "responseCancel") {
-    const auth = await authenticate(request, env, route);
-    if (!auth) return unauthorized();
     return handleResponseStateRoute(request, auth, route);
   }
 
   if (route.kind !== "chat" && route.kind !== "responses") return notFound();
 
   if (request.method !== "POST") return notFound();
-  const auth = await authenticate(request, env, route);
-  if (!auth) return unauthorized();
-
   const body = await parseJsonBody<unknown>(request);
+  const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : "composer-2.5";
+  if (auth.mode !== "proxy") {
+    return handleOpenAiCompletion(request, env, ctx, deps, route as CompletionRoute, auth, body);
+  }
+
+  const credentials = await loadRoutedCredentials(env, deps, {
+    accountId: auth.accountId,
+    fallbackApiKey: auth.cursorApiKey
+  });
+  const candidates = routeCandidates(
+    credentials,
+    requestedModel,
+    sessionAffinity(request) || `${route.kind}:${requestedModel}`
+  );
+  if (!candidates.length) {
+    throw new HttpError(`Model '${requestedModel}' is not available for this gateway account`, 404, "model_not_found", "model");
+  }
+
+  let lastError: unknown;
+  for (const credential of candidates) {
+    const routedAuth: AuthResult = { ...auth, cursorApiKey: credential.apiKey, credentialId: credential.id };
+    try {
+      return await handleOpenAiCompletion(
+        request,
+        env,
+        ctx,
+        deps,
+        route as CompletionRoute,
+        routedAuth,
+        body,
+        async (error) => markBillingModelDisabled(env, credential, requestedModel, errorText(error))
+      );
+    } catch (error) {
+      if (!isBillingError(error)) throw error;
+      lastError = error;
+      await markBillingModelDisabled(env, credential, requestedModel, error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new HttpError("No active Cursor credential can serve this model", 503, "cursor_credential_unavailable");
+}
+
+async function handleOpenAiCompletion(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  deps: Deps,
+  route: CompletionRoute,
+  auth: AuthResult,
+  body: unknown,
+  onBillingError?: (error: unknown) => Promise<void>
+): Promise<Response> {
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : "composer-2.5";
   const cursorModel = resolveCursorModel(requestedModel);
   if (route.surface === "opencodev2" && route.kind === "chat") {
-    return handleOpenCodeSdkChatRoute(request, env, ctx, deps, auth, body, cursorModel);
+    return handleOpenCodeSdkChatRoute(request, env, ctx, deps, auth, body, cursorModel, onBillingError);
   }
 
   const responseOwner = route.kind === "responses" ? await responseOwnerKey(auth) : undefined;
@@ -454,6 +596,7 @@ async function handleOpenAiRoute(
         ctx,
         deps,
         auth,
+        onBillingError,
         id,
         created,
         responseOwner,
@@ -477,8 +620,9 @@ async function handleOpenAiRoute(
         includeUsage: prepared.includeUsage,
         metadata: prepared.responseMetadata,
         tools: prepared.tools,
-        context: prepared.toolContext,
-        onDone: async (text, completionChars, toolCalls) => {
+          context: prepared.toolContext,
+          onBillingError,
+          onDone: async (text, completionChars, toolCalls) => {
           if (route.kind === "responses" && responseOwner) {
             const completed = responseObject({
               id,
@@ -575,6 +719,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
   ctx: ExecutionContext;
   deps: Deps;
   auth: AuthResult;
+  onBillingError?: (error: unknown) => Promise<void>;
   id: string;
   created: number;
   responseOwner?: string;
@@ -612,6 +757,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
       metadata: input.prepared.responseMetadata,
       tools: input.prepared.tools,
       context: input.prepared.toolContext,
+      onBillingError: input.onBillingError,
       onDone: async (text, completionChars, toolCalls) => {
         if (input.route.kind === "responses" && input.responseOwner) {
           const completed = responseObject({
@@ -719,7 +865,8 @@ async function handleOpenCodeSdkChatRoute(
   deps: Deps,
   auth: AuthResult,
   body: unknown,
-  cursorModel: { id: string } | undefined
+  cursorModel: { id: string } | undefined,
+  onBillingError?: (error: unknown) => Promise<void>
 ): Promise<Response> {
   const prepared = prepareOpencodeSdkChatRequest(body, cursorModel);
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -768,6 +915,7 @@ async function handleOpenCodeSdkChatRoute(
         metadata: prepared.responseMetadata,
         tools: prepared.tools,
         context: prepared.toolContext,
+        onBillingError,
         onDone: (_text, completionChars) =>
           finishLog({
             status: "completed",
@@ -831,6 +979,7 @@ function streamOpenAiResponse(
     metadata?: Record<string, unknown>;
     tools: OpenAiToolSpec[];
     context?: ToolCallContext;
+    onBillingError?: (error: unknown) => Promise<void>;
     onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
@@ -851,6 +1000,7 @@ function streamOpenAiEvents(
     metadata?: Record<string, unknown>;
     tools: OpenAiToolSpec[];
     context?: ToolCallContext;
+    onBillingError?: (error: unknown) => Promise<void>;
     onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
@@ -940,6 +1090,9 @@ function streamOpenAiEvents(
       }
       await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
     } catch (error) {
+      if (input.onBillingError && isBillingError(error)) {
+        await input.onBillingError(error).catch(() => undefined);
+      }
       await input.onError(error);
       const message = error instanceof Error ? error.message : "Stream failed";
       await writer.write(
@@ -961,6 +1114,10 @@ function sessionAffinity(request: Request): string | undefined {
     request.headers.get("x-opencode-session-id") ||
     request.headers.get("x-opencode-session")
   )?.trim() || undefined;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sdkSessionOwner(auth: AuthResult): string | undefined {

@@ -21,6 +21,8 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { extname, resolve, sep } from "node:path";
 
 import {
   createCursorCompletion,
@@ -49,7 +51,7 @@ import {
   type OpenAiToolSpec,
   type ToolCallContext
 } from "../worker/openai";
-import { collectCursorOutput, type CursorTextEvent } from "../worker/cursor";
+import { collectCursorOutput } from "../worker/cursor";
 import {
   createCursorSdkCompletion,
   collectCursorSdkOutput,
@@ -66,11 +68,18 @@ import {
   estimateTokens,
   mapModel
 } from "./anthropic";
+import {
+  canonicalModelId,
+  CursorCredentialPool,
+  isBillingError,
+  parseCursorCredentialEnv
+} from "./router";
+import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
-const LOCAL_API_KEY_LITERAL = "cursor-local";
 const PRIMARY_MODEL = "auto";
+const STATIC_DIR = process.env.STATIC_DIR?.trim() ? resolve(process.env.STATIC_DIR.trim()) : "";
 
 /**
  * Minimal `Deps` backed by the real runtime. Identical in spirit to the
@@ -109,6 +118,14 @@ function buildEnv(): Env {
 }
 
 const env = buildEnv();
+const credentialPool = new CursorCredentialPool(
+  parseCursorCredentialEnv(process.env.CURSOR_API_KEY || "", process.env.CURSOR_API_KEYS || ""),
+  process.env.CURSOR_ROUTER_STATE_PATH?.trim() || undefined,
+  process.env.ENCRYPTION_KEY
+);
+const authStatePath = process.env.LOCAL_AUTH_STATE_PATH?.trim()
+  || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".auth";
+const authStore = new LocalAuthStore(authStatePath, process.env.ADMIN_PASSWORD || "");
 
 /**
  * The SDK bridge path (full macOS parity) is the PRIMARY route for
@@ -165,21 +182,25 @@ function storeResponse(id: string, response: Record<string, unknown>): void {
 }
 
 /**
- * Resolve the Cursor API key for a request. The incoming bearer wins unless it
- * is absent or the local placeholder literal (`cursor-local`), in which case we
- * fall back to `CURSOR_API_KEY` from the environment.
+ * External API calls use client keys created in the local control console.
+ * Cursor credentials never leave the credential pool.
  */
-function resolveApiKey(request: Request): string {
-  // Anthropic clients (Claude Code) send the key as `x-api-key`; OpenAI clients use
-  // `Authorization: Bearer`. Either source, with `cursor-local`/empty falling back to the
-  // env key (Credential Manager).
+interface RequestAccess {
+  mode: "pool";
+}
+
+function requestApiKey(request: Request): string {
+  // Anthropic clients send the key as `x-api-key`; OpenAI clients use Bearer auth.
   const apiKeyHeader = (request.headers.get("x-api-key") || "").trim();
   const authorization = request.headers.get("authorization") || "";
   const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
   const bearer = match ? match[1].trim() : "";
   const candidate = apiKeyHeader || bearer;
-  if (candidate && candidate !== LOCAL_API_KEY_LITERAL) return candidate;
-  return (process.env.CURSOR_API_KEY || "").trim();
+  return candidate;
+}
+
+function resolveAccess(request: Request): RequestAccess | null {
+  return authStore.clientKey(requestApiKey(request)) ? { mode: "pool" } : null;
 }
 
 async function cursorModelSelection(requestedModel: string, body: unknown, apiKey?: string): Promise<{ id: string }> {
@@ -292,14 +313,16 @@ async function cursorModelSelection(requestedModel: string, body: unknown, apiKe
 // paths and the Cloudflare `ExecutionContext`.
 // ---------------------------------------------------------------------------
 
-function healthResponse(port: number): Response {
+function healthResponse(request: Request): Response {
   return json({
     ok: true,
     service: "api-for-cursor",
     host: HOST,
-    modelCatalog: "live-account-specific",
+    modelCatalog: credentialPool.credentials.length > 1 ? "multi-key-intersection" : "live-account-specific",
+    credentialCount: credentialPool.credentials.length,
+    clientKeyAuth: true,
     sdkVersion: "1.0.27",
-    baseUrl: `http://${HOST}:${port}/v1`
+    baseUrl: publicApiBaseUrl(request)
   });
 }
 
@@ -421,27 +444,222 @@ function openAiCatalogData(models: CursorCatalogModel[]): Array<Record<string, u
 }
 
 async function handleModels(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-  const models = await liveCursorModels(apiKey);
+  if (!resolveAccess(request)) return unauthorized();
+  const models = await credentialPool.intersectModels(liveCursorModels);
   return json({ object: "list", data: openAiCatalogData(models) });
 }
 
 async function handleModel(request: Request, id: string): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-  const models = openAiCatalogData(await liveCursorModels(apiKey));
+  if (!resolveAccess(request)) return unauthorized();
+  const catalog = await credentialPool.intersectModels(liveCursorModels);
+  const models = openAiCatalogData(catalog);
   const model = models.find((item) => item.id === id);
   if (!model) return openAiError(`Model '${id}' not found`, 404, "not_found", "model");
   return json(model);
 }
 
-async function handleChatCompletions(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
+function hasAdminSession(request: Request): boolean {
+  return authStore.isSessionValid(sessionToken(request));
+}
 
+function assertManagedCredentialStore(): void {
+  if (!process.env.ENCRYPTION_KEY?.trim() || !process.env.CURSOR_ROUTER_STATE_PATH?.trim()) {
+    throw new HttpError(
+      "ENCRYPTION_KEY and CURSOR_ROUTER_STATE_PATH are required for the local credential store",
+      503,
+      "server_error"
+    );
+  }
+}
+
+function configuredPublicBaseUrl(): string {
+  return authStore.publicBaseUrl() || (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+}
+
+function publicApiBaseUrl(request: Request): string {
+  const configured = configuredPublicBaseUrl();
+  return (configured || new URL(request.url).origin) + "/v1";
+}
+
+function normalizePublicBaseUrl(value: string): string {
+  const raw = value.trim().replace(/\/v1$/i, "").replace(/\/+$/, "");
+  if (!raw) return "";
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch {
+    throw new HttpError("Public URL must be a complete http(s) URL", 400, "invalid_request_error", "publicBaseUrl");
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.host) {
+    throw new HttpError("Public URL must use http or https", 400, "invalid_request_error", "publicBaseUrl");
+  }
+  return parsed.toString().replace(/\/$/, "").replace(/\/v1$/i, "");
+}
+
+async function handleAuthStatus(request: Request): Promise<Response> {
+  return json({ configured: authStore.isConfigured(), authenticated: hasAdminSession(request) });
+}
+
+async function handleAuthSetup(request: Request): Promise<Response> {
+  if (authStore.isConfigured()) throw new HttpError("Administrator password is already configured", 409, "conflict");
+  const body = await request.json() as Record<string, unknown>;
+  const password = typeof body.password === "string" ? body.password : "";
+  const token = authStore.setup(password);
+  if (!token) throw new HttpError("Password must contain at least 8 characters", 400, "invalid_request_error", "password");
+  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+}
+
+async function handleAuthLogin(request: Request): Promise<Response> {
+  if (!authStore.isConfigured()) throw new HttpError("Set an administrator password before signing in", 409, "setup_required");
+  const body = await request.json() as Record<string, unknown>;
+  const password = typeof body.password === "string" ? body.password : "";
+  const token = authStore.login(password);
+  if (!token) return unauthorized();
+  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+}
+
+function handleAuthLogout(request: Request): Response {
+  authStore.revokeSession(sessionToken(request));
+  return json({ ok: true }, { headers: { "set-cookie": sessionCookie("", 0) } });
+}
+
+async function handleSettings(request: Request): Promise<Response> {
+  if (!hasAdminSession(request)) return unauthorized();
+  if (request.method === "GET") return json({ publicBaseUrl: configuredPublicBaseUrl(), baseUrl: publicApiBaseUrl(request) });
+  if (request.method === "PUT") {
+    const body = await request.json() as Record<string, unknown>;
+    const value = typeof body.publicBaseUrl === "string" ? body.publicBaseUrl : "";
+    const publicBaseUrl = authStore.setPublicBaseUrl(normalizePublicBaseUrl(value));
+    return json({ publicBaseUrl, baseUrl: publicApiBaseUrl(request) });
+  }
+  return notFound();
+}
+
+async function handleClientKeys(request: Request, keyId = ""): Promise<Response> {
+  if (!hasAdminSession(request)) return unauthorized();
+  if (request.method === "GET" && !keyId) return json({ data: authStore.listClientKeys() });
+  if (request.method === "POST" && !keyId) {
+    const body = await request.json() as Record<string, unknown>;
+    const label = typeof body.label === "string" ? body.label : "Default";
+    const created = authStore.createClientKey(label);
+    return json({ ...created.info, token: created.token }, { status: 201 });
+  }
+  if (request.method === "DELETE" && keyId) {
+    if (!authStore.revokeClientKey(keyId)) return notFound();
+    return json({ id: keyId, revoked: true });
+  }
+  return notFound();
+}
+
+async function handleLocalCredentials(request: Request, credentialId = ""): Promise<Response> {
+  if (!hasAdminSession(request)) return unauthorized();
+
+  if (request.method === "GET" && !credentialId) {
+    const data = await Promise.all(credentialPool.credentials.map(async (credential) => {
+      let models: string[] = [];
+      if (credential.status === "active") {
+        try {
+          models = (await liveCursorModels(credential.apiKey))
+            .map((model) => model.id)
+            .filter((model) => !credential.disabledModels.has(canonicalModelId(model)));
+        } catch {
+          models = [];
+        }
+      }
+      return {
+        id: credential.id,
+        label: credential.label,
+        hint: credential.hint,
+        status: credential.status,
+        disabledReason: credential.disabledReason || null,
+        models,
+        disabledModels: [...credential.disabledModels]
+      };
+    }));
+    return json({ data });
+  }
+
+  if (request.method === "POST" && !credentialId) {
+    assertManagedCredentialStore();
+    const body = await request.json() as Record<string, unknown>;
+    const cursorApiKey = typeof body.cursorApiKey === "string" ? body.cursorApiKey.trim() : "";
+    const label = typeof body.label === "string" ? body.label.trim() : "Imported";
+    if (!cursorApiKey) throw new HttpError("Cursor API key is required", 400, "invalid_request_error", "cursorApiKey");
+    const models = await liveCursorModels(cursorApiKey);
+    const credential = credentialPool.addCredential(cursorApiKey, label);
+    return json({
+      id: credential.id,
+      label: credential.label,
+      hint: credential.hint,
+      cursorEmail: null,
+      models: models.map((model) => model.id),
+      disabledModels: [...credential.disabledModels]
+    }, { status: 201 });
+  }
+
+  if (request.method === "DELETE" && credentialId) {
+    if (!credentialPool.disableCredential(credentialId)) return notFound();
+    return json({ id: credentialId, disabled: true });
+  }
+
+  return notFound();
+}
+
+async function routeCredentialRequest(
+  request: Request,
+  requestedModel: string,
+  run: (apiKey: string, onBillingError?: (error: unknown) => void) => Promise<Response>
+): Promise<Response> {
+  if (!resolveAccess(request)) return unauthorized();
+
+  const candidates = await credentialPool.candidates(
+    requestedModel,
+    sessionAffinity(request),
+    liveCursorModels
+  );
+  if (!candidates.length) {
+    throw new HttpError(`Model '${requestedModel}' is not available for the configured Cursor credential pool`, 404, "model_not_found", "model");
+  }
+
+  let lastBillingError: unknown;
+  for (const credential of candidates) {
+    const disableOnBilling = (error: unknown): void => {
+      if (!isBillingError(error)) return;
+      credentialPool.disableModel(credential, requestedModel);
+      console.warn(JSON.stringify({
+        event: "cursor_model_disabled",
+        credentialId: credential.id,
+        credentialHint: credential.hint,
+        model: requestedModel,
+        reason: error instanceof Error ? error.message : String(error)
+      }));
+    };
+    try {
+      return await run(credential.apiKey, disableOnBilling);
+    } catch (error) {
+      if (!isBillingError(error)) throw error;
+      lastBillingError = error;
+      disableOnBilling(error);
+    }
+  }
+  throw lastBillingError instanceof Error
+    ? lastBillingError
+    : new HttpError("No Cursor credential can currently serve this model", 503, "cursor_credential_unavailable");
+}
+
+async function handleChatCompletions(request: Request): Promise<Response> {
   const body = await request.json();
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
+    handleChatCompletionsWithKey(request, body, requestedModel, apiKey, onBillingError)
+  ));
+}
+
+async function handleChatCompletionsWithKey(
+  request: Request,
+  body: unknown,
+  requestedModel: string,
+  apiKey: string,
+  onBillingError?: (error: unknown) => void
+): Promise<Response> {
   const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
   const prepared = prepareChatRequest(body, cursorModel);
 
@@ -449,7 +667,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel));
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel), onBillingError);
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -465,7 +683,8 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       promptChars: prepared.promptChars,
       includeUsage: prepared.includeUsage,
       tools: prepared.tools,
-      context: prepared.toolContext
+      context: prepared.toolContext,
+      onError: onBillingError
     });
   }
 
@@ -490,11 +709,20 @@ async function handleChatCompletions(request: Request): Promise<Response> {
 }
 
 async function handleResponses(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-
   const body = await request.json();
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
+    handleResponsesWithKey(request, body, requestedModel, apiKey, onBillingError)
+  ));
+}
+
+async function handleResponsesWithKey(
+  request: Request,
+  body: unknown,
+  requestedModel: string,
+  apiKey: string,
+  onBillingError?: (error: unknown) => void
+): Promise<Response> {
   const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
   const prepared = prepareResponsesRequest(body, cursorModel);
 
@@ -502,7 +730,7 @@ async function handleResponses(request: Request): Promise<Response> {
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("responses", request, prepared, apiKey, id, created);
+    return handleSdkRoute("responses", request, prepared, apiKey, id, created, undefined, onBillingError);
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -520,6 +748,7 @@ async function handleResponses(request: Request): Promise<Response> {
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
+      onError: onBillingError,
       onDone: (text, _completionChars, toolCalls) => {
         storeResponse(
           id,
@@ -662,12 +891,16 @@ function sdkAllowToolCall(prepared: PreparedRequest, toolCall: CursorToolCall) {
 
 /** Wrap an Anthropic SSE event generator into a streaming Response. On mid-stream failure
  * (after `message_start`), emit an Anthropic `error` event rather than a broken stream. */
-function anthropicSseResponse(events: AsyncGenerator<{ event: string; data: Record<string, unknown> }>): Response {
+function anthropicSseResponse(
+  events: AsyncGenerator<{ event: string; data: Record<string, unknown> }>,
+  onError?: (error: unknown) => void
+): Response {
   const readable = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         for await (const { event, data } of events) controller.enqueue(encodeSse(data, event));
       } catch (error) {
+        onError?.(error);
         const message = error instanceof Error ? error.message : String(error);
         controller.enqueue(encodeSse(anthropicError(message, "api_error"), "error"));
       } finally {
@@ -679,14 +912,23 @@ function anthropicSseResponse(events: AsyncGenerator<{ event: string; data: Reco
 }
 
 async function handleAnthropicMessages(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return json(anthropicError("Missing or invalid x-api-key.", "authentication_error"), { status: 401 });
-
   const body = await request.json();
   const requestedModel =
     body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
       ? (body as { model: string }).model
       : PRIMARY_MODEL;
+  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
+    handleAnthropicMessagesWithKey(request, body, requestedModel, apiKey, onBillingError)
+  ));
+}
+
+async function handleAnthropicMessagesWithKey(
+  request: Request,
+  body: unknown,
+  requestedModel: string,
+  apiKey: string,
+  onBillingError?: (error: unknown) => void
+): Promise<Response> {
   const translatedBody = anthropicToChatBody(body);
   const requestedContext = contextFromAnthropicBeta(request.headers.get("anthropic-beta"));
   if (requestedContext) translatedBody.cursor_context = requestedContext;
@@ -721,7 +963,7 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
       stream,
       tools: prepared.tools,
       toolContext: prepared.toolContext
-    }));
+    }), onBillingError);
   }
 
   const output = await collectCursorSdkOutput(stream);
@@ -739,9 +981,10 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
   );
 }
 
-/** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Same body shape as
- * `/v1/messages`. Auth is not required (it's only an estimate). */
+/** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Uses the
+ * same client API-key authorization as `/v1/messages`. */
 async function handleCountTokens(request: Request): Promise<Response> {
+  if (!resolveAccess(request)) return unauthorized();
   const body = await request.json();
   const translatedBody = anthropicToChatBody(body);
   const prepared = prepareChatRequest(translatedBody, await cursorModelSelection(mapModel(""), translatedBody));
@@ -755,7 +998,8 @@ async function handleSdkRoute(
   apiKey: string,
   id: string,
   created: number,
-  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"]
+  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"],
+  onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
   // Maintain one SDK agent per client session "under the hood": attempt 0 reuses the
@@ -791,6 +1035,7 @@ async function handleSdkRoute(
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
+      onError: onBillingError,
       onDone: (text, _completionChars, toolCalls) => {
         if (kind === "responses") {
           storeResponse(
@@ -857,6 +1102,7 @@ function logToolForwarding(surface: string, prepared: PreparedRequest): void {
 }
 
 function handleResponseState(request: Request, responseId: string): Response {
+  if (!resolveAccess(request)) return unauthorized();
   const stored = responseStore.get(responseId);
   if (!stored) return openAiError("Response not found", 404, "not_found");
   if (request.method === "GET" || request.method === "HEAD") {
@@ -885,6 +1131,7 @@ interface StreamInput {
   tools: OpenAiToolSpec[];
   context?: ToolCallContext;
   onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
+  onError?: (error: unknown) => void | Promise<void>;
 }
 
 function streamOpenAiResponse(kind: "chat" | "responses", cursorStream: Response, input: StreamInput): Response {
@@ -991,6 +1238,7 @@ function streamOpenAiEvents(
       }
       input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
     } catch (error) {
+      await input.onError?.(error);
       const message = error instanceof Error ? error.message : "Stream failed";
       await writer
         .write(
@@ -1005,6 +1253,42 @@ function streamOpenAiEvents(
   };
   void pump();
   return sseResponse(readable);
+}
+
+function staticContentType(filePath: string): string {
+  const types: Record<string, string> = {
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp"
+  };
+  return types[extname(filePath).toLowerCase()] || "application/octet-stream";
+}
+
+function serveStatic(request: Request, pathname: string): Response {
+  if (!STATIC_DIR || (request.method !== "GET" && request.method !== "HEAD")) return notFound();
+  let decoded: string;
+  try { decoded = decodeURIComponent(pathname); } catch { return notFound(); }
+  const requested = decoded === "/" || !extname(decoded) ? "/index.html" : decoded;
+  const filePath = resolve(STATIC_DIR, `.${requested}`);
+  if (filePath !== STATIC_DIR && !filePath.startsWith(`${STATIC_DIR}${sep}`)) return notFound();
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) return notFound();
+  const headers = new Headers({
+    "content-type": staticContentType(filePath),
+    "cache-control": requested === "/index.html" || /\.(?:css|js|map)$/.test(requested)
+      ? "no-cache"
+      : "public, max-age=3600"
+  });
+  const body = request.method === "HEAD" ? null : new Uint8Array(readFileSync(filePath));
+  return new Response(body, { headers });
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,7 +1314,43 @@ async function route(request: Request, port: number): Promise<Response> {
   try {
     if (pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return notFound();
-      return healthResponse(port);
+      return healthResponse(request);
+    }
+
+    if (pathname === "/api/auth/status") {
+      if (request.method !== "GET") return notFound();
+      return await handleAuthStatus(request);
+    }
+
+    if (pathname === "/api/auth/setup") {
+      if (request.method !== "POST") return notFound();
+      return await handleAuthSetup(request);
+    }
+
+    if (pathname === "/api/auth/login") {
+      if (request.method !== "POST") return notFound();
+      return await handleAuthLogin(request);
+    }
+
+    if (pathname === "/api/auth/logout") {
+      if (request.method !== "POST") return notFound();
+      return handleAuthLogout(request);
+    }
+
+    if (pathname === "/api/settings") return await handleSettings(request);
+
+    if (pathname === "/api/keys") return await handleClientKeys(request);
+
+    const clientKeyMatch = /^\/api\/keys\/([^/]+)$/.exec(pathname);
+    if (clientKeyMatch) return await handleClientKeys(request, decodeURIComponent(clientKeyMatch[1]));
+
+    if (pathname === "/api/credentials") {
+      return await handleLocalCredentials(request);
+    }
+
+    const credentialMatch = /^\/api\/credentials\/([^/]+)$/.exec(pathname);
+    if (credentialMatch) {
+      return await handleLocalCredentials(request, decodeURIComponent(credentialMatch[1]));
     }
 
     const v1Path = pathname.startsWith("/v1/") ? pathname.slice(3) : pathname === "/v1" ? "/" : "";
@@ -1071,7 +1391,10 @@ async function route(request: Request, port: number): Promise<Response> {
       return handleResponseState(request, decodeURIComponent(responseMatch[1]));
     }
 
-    return notFound();
+    if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/v1" || pathname.startsWith("/v1/")) {
+      return notFound();
+    }
+    return serveStatic(request, pathname);
   } catch (error) {
     return errorResponse(error);
   }
@@ -1083,7 +1406,10 @@ async function route(request: Request, port: number): Promise<Response> {
 
 function toWebRequest(req: IncomingMessage, port: number): Request {
   const method = req.method || "GET";
-  const url = `http://${HOST}:${port}${req.url || "/"}`;
+  const authority = typeof req.headers.host === "string" && req.headers.host.trim()
+    ? req.headers.host.trim()
+    : `${HOST}:${port}`;
+  const url = `http://${authority}${req.url || "/"}`;
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;

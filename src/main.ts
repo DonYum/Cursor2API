@@ -1,11 +1,21 @@
 import { hydrateIcons, wireCopyButtons } from "./ui";
 
 const isChatRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/chat";
+const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/dashboard";
 
 async function route(): Promise<void> {
   const landing = document.getElementById("landing");
   const chatRoot = document.getElementById("chat-root");
   if (!landing || !chatRoot) return;
+
+  if (isDashboardRoute()) {
+    landing.hidden = true;
+    chatRoot.hidden = false;
+    document.title = "Dashboard - API for Cursor";
+    const { mountDashboard } = await import("./dashboard");
+    mountDashboard(chatRoot);
+    return;
+  }
 
   if (isChatRoute()) {
     landing.hidden = true;
@@ -27,7 +37,7 @@ document.addEventListener("click", (event) => {
   const anchor = (event.target as HTMLElement | null)?.closest("a");
   if (!anchor) return;
   const href = anchor.getAttribute("href") || "";
-  if (href !== "/" && href !== "/chat") return;
+  if (href !== "/" && href !== "/chat" && href !== "/dashboard") return;
   if (anchor.target === "_blank") return;
   event.preventDefault();
   if (window.location.pathname !== href) {
@@ -41,11 +51,17 @@ window.addEventListener("popstate", () => void route());
 let landingReady = false;
 
 function mountLanding(): void {
+  const baseUrl = `${window.location.origin}/v1`;
+  document.querySelectorAll<HTMLElement>("[data-base-url]").forEach((element) => {
+    element.textContent = baseUrl;
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-copy-base-url]").forEach((button) => {
+    button.dataset.copy = baseUrl;
+  });
   hydrateIcons(document);
   wireCopyButtons(document);
   if (landingReady) return;
   landingReady = true;
-  bindEndpointModal();
   bindHeaderScroll();
   bindScrollReveal();
 }
@@ -85,34 +101,6 @@ function bindScrollReveal(): void {
   );
 
   for (const el of targets) observer.observe(el);
-}
-
-function bindEndpointModal(): void {
-  const modal = document.querySelector<HTMLElement>("[data-endpoint-modal]");
-  const openButtons = document.querySelectorAll<HTMLButtonElement>("[data-endpoint-modal-open]");
-  const closeButtons = document.querySelectorAll<HTMLButtonElement>("[data-endpoint-modal-close]");
-  if (!modal) return;
-
-  const setOpen = (open: boolean): void => {
-    modal.hidden = !open;
-    document.body.classList.toggle("modal-open", open);
-    if (open) {
-      window.setTimeout(() => closeButtons[0]?.focus(), 0);
-    }
-  };
-
-  for (const button of openButtons) {
-    button.addEventListener("click", () => setOpen(true));
-  }
-  for (const button of closeButtons) {
-    button.addEventListener("click", () => setOpen(false));
-  }
-  modal.addEventListener("click", (event) => {
-    if (event.target === modal) setOpen(false);
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !modal.hidden) setOpen(false);
-  });
 }
 
 void route();
