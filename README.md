@@ -158,6 +158,15 @@ npm run stop:local
 
 启动后打开 `http://127.0.0.1:6718/dashboard`。首次访问设置管理员密码，随后导入 Cursor Key 并创建客户端使用的独立 `sk-…` API Key。前端、控制台、管理 API 和 `/v1/*` 网关均由 `6718` 端口上的同一个进程提供。
 
+#### 获取 Cursor API Key
+
+1. 打开 [cursor.com/dashboard](https://cursor.com/dashboard)。
+2. 在左侧功能栏选择 **API KEY**。
+3. 点击 **新建**，按 Cursor 页面提示创建密钥。
+4. 复制页面显示的 `crsr_...` 密钥，并粘贴到网关控制台的“添加 Cursor 账号”中。
+
+密钥只用于网关连接 Cursor；客户端应使用控制台创建的独立 `sk-...` Key，不要把 `crsr_...` 直接配置给 OpenAI、Anthropic 或其他客户端。
+
 验证服务：
 
 ```bash
@@ -192,7 +201,7 @@ bun run sidecar/server.ts
 | 用途 | 地址 |
 | :-- | :-- |
 | OpenAI 兼容（Codex / Chat） | `http://127.0.0.1:6718/v1` |
-| Anthropic 兼容（Claude Code） | `http://127.0.0.1:6718` |
+| Anthropic 兼容（Claude Code） | `http://127.0.0.1:6718/v1` |
 | 凭据管理后台 | `http://127.0.0.1:6718/dashboard` |
 | 健康检查 | `http://127.0.0.1:6718/health` |
 
