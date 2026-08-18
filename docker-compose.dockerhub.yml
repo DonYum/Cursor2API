@@ -1,11 +1,10 @@
 name: cursor2api
 
+# Pull-only deployment. This file intentionally has no build sections, so a
+# server can deploy cursor2api with Docker alone and without cloning the repo.
 services:
   bridge:
-    image: ${CURSOR2API_BRIDGE_IMAGE:-docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}}
-    build:
-      context: .
-      dockerfile: containers/cursor-sdk-bridge/Dockerfile
+    image: docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}
     environment:
       CURSOR_SDK_BRIDGE_HOST: 0.0.0.0
       CURSOR_SDK_BRIDGE_PORT: 8792
@@ -22,10 +21,7 @@ services:
     restart: unless-stopped
 
   api:
-    image: ${CURSOR2API_API_IMAGE:-docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}}
-    build:
-      context: .
-      dockerfile: containers/sidecar/Dockerfile
+    image: docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}
     depends_on:
       bridge:
         condition: service_healthy

@@ -210,15 +210,17 @@ npm run deploy
 
 ### Docker Compose（预构建镜像）
 
-仓库提供两个容器：预编译的 API Sidecar 和 Node SDK Bridge。默认镜像发布到
-GHCR；如果镜像尚未拉取，Compose 也可以根据仓库中的 Dockerfile 本地构建。
+仓库提供两个容器：预编译的 API Sidecar 和 Node SDK Bridge。镜像会发布到
+Docker Hub（`docker.io/<用户名>/cursor2api-api` 和
+`docker.io/<用户名>/cursor2api-bridge`）；保留的标准 Compose 也可以根据仓库中的
+Dockerfile 本地构建。
 
 ```bash
 cp .env.docker.example .env
 # 编辑 .env，设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
 # Cursor Key 可以预先通过 CURSOR_API_KEY(S) 配置，也可以启动后在 Dashboard 导入
 
-# 使用已发布的预构建镜像
+# 使用仓库中的 Compose（可拉取镜像，也可 `--build` 本地构建）
 docker compose pull
 docker compose up
 ```
@@ -233,12 +235,42 @@ docker compose ps
 curl http://127.0.0.1:6718/health
 ```
 
-没有可用的 GHCR 镜像时，直接在仓库目录执行 `docker compose up --build` 即可本地
+没有可用的预构建镜像时，直接在仓库目录执行 `docker compose up --build` 即可本地
 编译并启动。停止并清理容器和网络：
 
 ```bash
 docker compose down
 ```
+
+#### 直接拉 Docker Hub 镜像部署
+
+服务器不需要安装 Node、Bun，也不需要克隆源码。准备一个空目录，下载 Docker Hub
+专用 Compose 文件和环境变量模板，然后直接启动：
+
+```bash
+mkdir -p cursor2api && cd cursor2api
+curl -fsSLo docker-compose.yml https://raw.githubusercontent.com/NGLSG/Cursor2API/master/docker-compose.dockerhub.yml
+curl -fsSLo .env https://raw.githubusercontent.com/NGLSG/Cursor2API/master/.env.docker.example
+# 编辑 .env：至少设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+默认使用 `docker.io/nglsg/cursor2api-api:latest` 和
+`docker.io/nglsg/cursor2api-bridge:latest`。如果你发布到自己的 Docker Hub
+命名空间，在 `.env` 中修改 `CURSOR2API_IMAGE_NAMESPACE`；指定版本时设置
+`CURSOR2API_IMAGE_TAG`，例如 `v0.2.0`。控制台地址为
+`http://服务器地址:6718/dashboard`，日志和停止命令分别是：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+Docker Hub 自动发布需要在 GitHub 仓库配置 `DOCKERHUB_USERNAME` 和
+`DOCKERHUB_TOKEN` 两个 Actions Secrets。推送 `master` 或 `v*` 标签后会发布 API
+和 Bridge 两个镜像。
 
 ## 客户端接入
 
