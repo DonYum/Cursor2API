@@ -1152,11 +1152,13 @@ function streamOpenAiEvents(
     const streamedToolCalls: OpenAiToolCall[] = [];
     let responseNextOutputIndex = 0;
     let responseTextOutputIndex: number | null = null;
+    let responseSequenceNumber = 0;
+    const nextResponseSequence = () => responseSequenceNumber++;
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
       } else {
-        for (const event of responseCreatedEvents(input)) await writer.write(event);
+        for (const event of responseCreatedEvents({ ...input, nextSequence: nextResponseSequence })) await writer.write(event);
       }
 
       for await (const event of cursorEvents) {
@@ -1168,11 +1170,11 @@ function streamOpenAiEvents(
             if (responseTextOutputIndex === null) {
               responseTextOutputIndex = responseNextOutputIndex;
               responseNextOutputIndex += 1;
-              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
+              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence })) {
                 await writer.write(chunk);
               }
             }
-            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex }));
+            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence }));
           }
         }
         if (event.type === "tool_call") {
@@ -1191,7 +1193,7 @@ function streamOpenAiEvents(
               chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } })
             );
           } else {
-            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex })) {
+            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex, nextSequence: nextResponseSequence })) {
               await writer.write(chunk);
             }
             responseNextOutputIndex += 1;
@@ -1222,7 +1224,7 @@ function streamOpenAiEvents(
         if (responseTextOutputIndex === null && !streamedToolCalls.length) {
           responseTextOutputIndex = responseNextOutputIndex;
           responseNextOutputIndex += 1;
-          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
+          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence })) {
             await writer.write(chunk);
           }
         }
@@ -1231,7 +1233,8 @@ function streamOpenAiEvents(
           text,
           toolCalls: streamedToolCalls,
           textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
+          textOutputIndex: responseTextOutputIndex ?? 0,
+          nextSequence: nextResponseSequence
         })) {
           await writer.write(event);
         }
@@ -1243,7 +1246,7 @@ function streamOpenAiEvents(
       await writer
         .write(
           kind === "responses"
-            ? responseErrorEvent(message)
+            ? responseErrorEvent(message, nextResponseSequence())
             : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
         )
         .catch(() => undefined);

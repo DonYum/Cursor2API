@@ -505,7 +505,20 @@ export function chatUsageChunk(input: {
   });
 }
 
-export function responseCreatedEvents(input: { id: string; created: number; model: string; metadata?: Record<string, unknown> }): Uint8Array[] {
+type ResponseSequenceProvider = () => number;
+
+function responseSse(data: Record<string, unknown>, event: string, nextSequence?: ResponseSequenceProvider): Uint8Array {
+  const payload = nextSequence ? { ...data, sequence_number: nextSequence() } : data;
+  return encodeSse(payload, event);
+}
+
+export function responseCreatedEvents(input: {
+  id: string;
+  created: number;
+  model: string;
+  metadata?: Record<string, unknown>;
+  nextSequence?: ResponseSequenceProvider;
+}): Uint8Array[] {
   const base = {
     id: input.id,
     object: "response",
@@ -528,8 +541,8 @@ export function responseCreatedEvents(input: { id: string; created: number; mode
     ...input.metadata
   };
   return [
-    encodeSse({ type: "response.created", response: base }, "response.created"),
-    encodeSse({ type: "response.in_progress", response: base }, "response.in_progress")
+    responseSse({ type: "response.created", response: base }, "response.created", input.nextSequence),
+    responseSse({ type: "response.in_progress", response: base }, "response.in_progress", input.nextSequence)
   ];
 }
 
@@ -549,7 +562,7 @@ export function responseErrorEvent(message: string, sequenceNumber = 0): Uint8Ar
   );
 }
 
-export function responseTextStartEvents(input: { id: string; outputIndex: number }): Uint8Array[] {
+export function responseTextStartEvents(input: { id: string; outputIndex: number; nextSequence?: ResponseSequenceProvider }): Uint8Array[] {
   const item = {
     id: `msg_${input.id.slice(5)}`,
     type: "message",
@@ -558,8 +571,8 @@ export function responseTextStartEvents(input: { id: string; outputIndex: number
     content: []
   };
   return [
-    encodeSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added"),
-    encodeSse(
+    responseSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added", input.nextSequence),
+    responseSse(
       {
         type: "response.content_part.added",
         item_id: item.id,
@@ -567,13 +580,14 @@ export function responseTextStartEvents(input: { id: string; outputIndex: number
         content_index: 0,
         part: { type: "output_text", text: "", annotations: [] }
       },
-      "response.content_part.added"
+      "response.content_part.added",
+      input.nextSequence
     )
   ];
 }
 
-export function responseDeltaEvent(input: { id: string; delta: string; outputIndex?: number }): Uint8Array {
-  return encodeSse(
+export function responseDeltaEvent(input: { id: string; delta: string; outputIndex?: number; nextSequence?: ResponseSequenceProvider }): Uint8Array {
+  return responseSse(
     {
       type: "response.output_text.delta",
       item_id: `msg_${input.id.slice(5)}`,
@@ -581,11 +595,17 @@ export function responseDeltaEvent(input: { id: string; delta: string; outputInd
       content_index: 0,
       delta: input.delta
     },
-    "response.output_text.delta"
+    "response.output_text.delta",
+    input.nextSequence
   );
 }
 
-export function responseToolCallEvents(input: { id: string; toolCall: OpenAiToolCall; outputIndex: number }): Uint8Array[] {
+export function responseToolCallEvents(input: {
+  id: string;
+  toolCall: OpenAiToolCall;
+  outputIndex: number;
+  nextSequence?: ResponseSequenceProvider;
+}): Uint8Array[] {
   const customCall = codeModeCustomToolCall(input.toolCall);
   if (customCall) {
     const item = {
@@ -598,26 +618,28 @@ export function responseToolCallEvents(input: { id: string; toolCall: OpenAiTool
     };
     const doneItem = { ...item, status: "completed", input: customCall.input };
     return [
-      encodeSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added"),
-      encodeSse(
+      responseSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added", input.nextSequence),
+      responseSse(
         {
           type: "response.custom_tool_call_input.delta",
           item_id: item.id,
           output_index: input.outputIndex,
           delta: customCall.input
         },
-        "response.custom_tool_call_input.delta"
+        "response.custom_tool_call_input.delta",
+        input.nextSequence
       ),
-      encodeSse(
+      responseSse(
         {
           type: "response.custom_tool_call_input.done",
           item_id: item.id,
           output_index: input.outputIndex,
           input: customCall.input
         },
-        "response.custom_tool_call_input.done"
+        "response.custom_tool_call_input.done",
+        input.nextSequence
       ),
-      encodeSse({ type: "response.output_item.done", output_index: input.outputIndex, item: doneItem }, "response.output_item.done")
+      responseSse({ type: "response.output_item.done", output_index: input.outputIndex, item: doneItem }, "response.output_item.done", input.nextSequence)
     ];
   }
   const item = {
@@ -630,26 +652,28 @@ export function responseToolCallEvents(input: { id: string; toolCall: OpenAiTool
   };
   const doneItem = { ...item, status: "completed", arguments: input.toolCall.function.arguments };
   return [
-    encodeSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added"),
-    encodeSse(
+    responseSse({ type: "response.output_item.added", output_index: input.outputIndex, item }, "response.output_item.added", input.nextSequence),
+    responseSse(
       {
         type: "response.function_call_arguments.delta",
         item_id: item.id,
         output_index: input.outputIndex,
         delta: input.toolCall.function.arguments
       },
-      "response.function_call_arguments.delta"
+      "response.function_call_arguments.delta",
+      input.nextSequence
     ),
-    encodeSse(
+    responseSse(
       {
         type: "response.function_call_arguments.done",
         item_id: item.id,
         output_index: input.outputIndex,
         arguments: input.toolCall.function.arguments
       },
-      "response.function_call_arguments.done"
+      "response.function_call_arguments.done",
+      input.nextSequence
     ),
-    encodeSse({ type: "response.output_item.done", output_index: input.outputIndex, item: doneItem }, "response.output_item.done")
+    responseSse({ type: "response.output_item.done", output_index: input.outputIndex, item: doneItem }, "response.output_item.done", input.nextSequence)
   ];
 }
 
@@ -670,26 +694,30 @@ export function responseDoneEvents(input: {
   metadata?: Record<string, unknown>;
   textStarted?: boolean;
   textOutputIndex?: number;
+  nextSequence?: ResponseSequenceProvider;
 }): Uint8Array[] {
   const itemId = `msg_${input.id.slice(5)}`;
   const part = { type: "output_text", text: input.text, annotations: [] };
   const item = { id: itemId, type: "message", status: "completed", role: "assistant", content: [part] };
   const textEvents = input.textStarted || !(input.toolCalls ?? []).length ? [
-    encodeSse(
+    responseSse(
       { type: "response.output_text.done", item_id: itemId, output_index: input.textOutputIndex ?? 0, content_index: 0, text: input.text },
-      "response.output_text.done"
+      "response.output_text.done",
+      input.nextSequence
     ),
-    encodeSse(
+    responseSse(
       { type: "response.content_part.done", item_id: itemId, output_index: input.textOutputIndex ?? 0, content_index: 0, part },
-      "response.content_part.done"
+      "response.content_part.done",
+      input.nextSequence
     ),
-    encodeSse({ type: "response.output_item.done", output_index: input.textOutputIndex ?? 0, item }, "response.output_item.done")
+    responseSse({ type: "response.output_item.done", output_index: input.textOutputIndex ?? 0, item }, "response.output_item.done", input.nextSequence)
   ] : [];
   return [
     ...textEvents,
-    encodeSse(
+    responseSse(
       { type: "response.completed", response: responseObject(input) },
-      "response.completed"
+      "response.completed",
+      input.nextSequence
     )
   ];
 }

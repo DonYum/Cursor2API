@@ -1140,6 +1140,11 @@ describe("Worker", () => {
     expect(body).toContain("event: response.output_text.delta");
     expect(body).toContain("event: response.completed");
     expect(body).toContain("Hello from Composer");
+    const responseEvents = parseSseJsonEvents(body);
+    expect(responseEvents.length).toBeGreaterThan(0);
+    responseEvents.forEach((event, index) => {
+      expect(event.sequence_number).toBe(index);
+    });
     expect(db.requestLogs.size).toBe(0);
   });
 
@@ -2282,6 +2287,17 @@ function concatTestBytes(chunks: Uint8Array[]): Uint8Array {
 
 function sseFrame(event: string, data: unknown, id?: string): Uint8Array {
   return new TextEncoder().encode(`${id ? `id: ${id}\n` : ""}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function parseSseJsonEvents(body: string): Array<Record<string, unknown>> {
+  const events: Array<Record<string, unknown>> = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trimStart();
+    if (!data || data === "[DONE]") continue;
+    events.push(JSON.parse(data) as Record<string, unknown>);
+  }
+  return events;
 }
 
 function chatResponseThinking(text: string): Uint8Array {
