@@ -110,6 +110,26 @@ describe("Cursor SDK harness", () => {
         required: ["payload"]
       }
     });
+    const diagnostics = cursorSdkTestExports.cursorSdkPreCallDiagnostics({
+      CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk"
+    } as any, {
+      prompt: { text: "Inspect the repo" },
+      model: { id: "grok-4.6" },
+      clientTools
+    });
+    expect(diagnostics).toMatchObject({
+      bridgeMode: "url",
+      modelId: "grok-4.6",
+      promptChars: 16,
+      hasIncrementalPrompt: false,
+      clientToolsCount: 24
+    });
+    const clientToolsBytes = diagnostics.clientToolsBytes as number;
+    const bridgeToolsBytes = diagnostics.bridgeToolsBytes as number;
+    const bridgeBodyBytes = diagnostics.bridgeBodyBytesRedacted as number;
+    expect(clientToolsBytes).toBeGreaterThan(16_000);
+    expect(bridgeToolsBytes).toBeLessThan(8_000);
+    expect(bridgeBodyBytes).toBeGreaterThan(bridgeToolsBytes);
   });
 
   it("keeps small client tool schemas unchanged for the SDK bridge", async () => {
