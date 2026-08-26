@@ -45,6 +45,10 @@ export function encodeSse(data: unknown, event?: string): Uint8Array {
   return encoder.encode(lines.join("\n"));
 }
 
+export function encodeSseComment(comment = "keepalive"): Uint8Array {
+  return encoder.encode(`: ${comment.replaceAll(/\r|\n/g, " ")}\n\n`);
+}
+
 function parseFrame(frame: string): SseEvent | null {
   let id: string | undefined;
   let event: string | undefined;
