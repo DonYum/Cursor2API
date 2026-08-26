@@ -1788,6 +1788,48 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.prompt.text).toContain(parameterDescription);
   });
 
+  it("truncates oversized Responses agent input before the bridge body limit", () => {
+    const latestUserText = "LATEST_USER_REQUEST_MUST_STAY_VISIBLE";
+    const largeToolOutput = `BEGIN_LARGE_TOOL_OUTPUT\n${"x".repeat(1_300_000)}\nEND_LARGE_TOOL_OUTPUT`;
+    const prepared = prepareResponsesRequest(
+      {
+        model: "grok-4.6",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "inspect the repository" }] },
+          {
+            type: "function_call",
+            call_id: "call_shell",
+            name: "shell_command",
+            arguments: JSON.stringify({ command: "cat large.log", workdir: "/workspace" })
+          },
+          { type: "function_call_output", call_id: "call_shell", output: largeToolOutput },
+          { role: "user", content: [{ type: "input_text", text: latestUserText }] }
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "shell_command",
+            parameters: {
+              type: "object",
+              properties: {
+                command: { type: "string" },
+                workdir: { type: "string" }
+              },
+              required: ["command"]
+            }
+          }
+        ]
+      },
+      { id: "grok-4.6" }
+    );
+
+    expect(new TextEncoder().encode(prepared.prompt.text).byteLength).toBeLessThanOrEqual(800_000);
+    expect(prepared.prompt.text).toContain("Cursor2API truncated oversized Responses INPUT");
+    expect(prepared.prompt.text).toContain("TOOL RESULT (name=shell_command tool_call_id=call_shell)");
+    expect(prepared.prompt.text).toContain(latestUserText);
+    expect(prepared.tools[0].name).toBe("shell_command");
+  });
+
   it("feeds Responses pi bash outputs back with SDK millisecond timeout arguments", () => {
     const prepared = prepareResponsesRequest(
       {
