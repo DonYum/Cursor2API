@@ -13,7 +13,11 @@ import {
 
 describe("OpenAI compatibility adapter", () => {
   it("encodes Responses stream failures as schema-valid error events", () => {
-    const event = new TextDecoder().decode(responseErrorEvent("Authentication error", 2));
+    const event = new TextDecoder().decode(responseErrorEvent("Authentication error", 2, {
+      type: "invalid_request_error",
+      code: "unauthorized",
+      status: 401
+    }));
     const data = JSON.parse(event.match(/^data: (.+)$/m)?.[1] ?? "{}");
 
     expect(event).toContain("event: error");
@@ -21,11 +25,24 @@ describe("OpenAI compatibility adapter", () => {
       type: "error",
       sequence_number: 2,
       error: {
-        type: "cursor_error",
-        code: "cursor_stream_error",
+        type: "invalid_request_error",
+        code: "unauthorized",
         message: "Authentication error",
-        param: null
+        param: null,
+        status: 401
       }
+    });
+  });
+
+  it("keeps the legacy Responses stream error shape when details are absent", () => {
+    const event = new TextDecoder().decode(responseErrorEvent("Stream failed", 3));
+    const data = JSON.parse(event.match(/^data: (.+)$/m)?.[1] ?? "{}");
+
+    expect(data.error).toEqual({
+      type: "cursor_error",
+      code: "cursor_stream_error",
+      message: "Stream failed",
+      param: null
     });
   });
 

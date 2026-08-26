@@ -4,6 +4,7 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import {
   bridgePrompt,
+  bridgeStreamErrorLogPayload,
   clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
   composerToolCallFromText,
@@ -89,6 +90,39 @@ describe("Cursor SDK local-agent bridge", () => {
         status: 401
       }
     });
+  });
+
+  it("summarizes stream failures without logging key, prompt, or tool arguments", () => {
+    const input = {
+      requestId: "resp_1234567890abcdef",
+      apiKey: "crsr_secret",
+      prompt: { text: "private prompt" },
+      model: "grok-4.6",
+      requiresLocalTool: true,
+      clientTools: [{ name: "Bash", arguments: { command: "secret command" } }]
+    };
+    const error = new Error("Cursor SDK bridge run timed out.");
+    error.status = 504;
+    error.code = "cursor_sdk_timeout";
+
+    const payload = bridgeStreamErrorLogPayload(input, error, { emittedEvents: 1, closed: false });
+
+    expect(payload).toEqual({
+      event: "cursor_sdk_bridge_stream_error",
+      requestIdPrefix: "resp_1234567890a",
+      model: "grok-4.6",
+      toolCount: 1,
+      requiresLocalTool: true,
+      emittedEvents: 1,
+      closed: false,
+      errorType: "api_error",
+      errorCode: "cursor_sdk_timeout",
+      errorStatus: 504,
+      errorMessage: "Cursor SDK bridge run timed out."
+    });
+    expect(JSON.stringify(payload)).not.toContain("crsr_secret");
+    expect(JSON.stringify(payload)).not.toContain("private prompt");
+    expect(JSON.stringify(payload)).not.toContain("secret command");
   });
 
   it("keeps public Composer aliases distinct before SDK model selection", () => {

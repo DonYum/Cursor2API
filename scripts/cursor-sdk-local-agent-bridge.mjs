@@ -54,6 +54,7 @@ export {
   isForwardableSDKToolCall,
   isAuthenticationSDKError,
   isRetryableSDKRunError,
+  bridgeStreamErrorLogPayload,
   composerToolCallFromText,
   normalizeSDKToolCall,
   normalizeModel,
@@ -172,6 +173,7 @@ async function handleClientToolCallback(request, response) {
 
 async function streamLocalAgent(input, response) {
   let closed = false;
+  let emittedEventCount = 0;
   const markClosed = () => {
     closed = true;
   };
@@ -188,13 +190,19 @@ async function streamLocalAgent(input, response) {
     if (closed) return false;
     const wrote = writeNdjson(response, event);
     if (!wrote) closed = true;
+    else emittedEventCount += 1;
     return wrote;
   };
   try {
     const output = await runLocalAgent(input, emit);
     emit({ type: "done", output });
   } catch (error) {
-    emit({ type: "error", error: openAiError(error).error });
+    const apiError = openAiError(error).error;
+    console.error(JSON.stringify(bridgeStreamErrorLogPayload(input, error, {
+      emittedEvents: emittedEventCount,
+      closed
+    })));
+    emit({ type: "error", error: apiError });
   } finally {
     response.off("close", markClosed);
     response.off("error", markClosed);
@@ -2382,6 +2390,23 @@ function openAiError(error) {
       code,
       status
     }
+  };
+}
+
+function bridgeStreamErrorLogPayload(input, error, state = {}) {
+  const apiError = openAiError(error).error;
+  return {
+    event: "cursor_sdk_bridge_stream_error",
+    requestIdPrefix: typeof input?.requestId === "string" ? input.requestId.slice(0, 16) : undefined,
+    model: typeof input?.model === "string" ? input.model : undefined,
+    toolCount: Array.isArray(input?.clientTools) ? input.clientTools.length : 0,
+    requiresLocalTool: input?.requiresLocalTool === true,
+    emittedEvents: Number.isInteger(state.emittedEvents) ? state.emittedEvents : 0,
+    closed: state.closed === true,
+    errorType: apiError.type,
+    errorCode: apiError.code,
+    errorStatus: apiError.status,
+    errorMessage: apiError.message
   };
 }
 

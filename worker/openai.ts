@@ -507,6 +507,13 @@ export function chatUsageChunk(input: {
 
 type ResponseSequenceProvider = () => number;
 
+export interface ResponseErrorInfo {
+  type?: string;
+  code?: string;
+  status?: number;
+  param?: string | null;
+}
+
 function responseSse(data: Record<string, unknown>, event: string, nextSequence?: ResponseSequenceProvider): Uint8Array {
   const payload = nextSequence ? { ...data, sequence_number: nextSequence() } : data;
   return encodeSse(payload, event);
@@ -546,17 +553,19 @@ export function responseCreatedEvents(input: {
   ];
 }
 
-export function responseErrorEvent(message: string, sequenceNumber = 0): Uint8Array {
+export function responseErrorEvent(message: string, sequenceNumber = 0, error: ResponseErrorInfo = {}): Uint8Array {
+  const errorPayload: Record<string, unknown> = {
+    type: error.type || "cursor_error",
+    code: error.code || "cursor_stream_error",
+    message,
+    param: error.param ?? null
+  };
+  if (Number.isInteger(error.status)) errorPayload.status = error.status;
   return encodeSse(
     {
       type: "error",
       sequence_number: sequenceNumber,
-      error: {
-        type: "cursor_error",
-        code: "cursor_stream_error",
-        message,
-        param: null
-      }
+      error: errorPayload
     },
     "error"
   );
