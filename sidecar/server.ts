@@ -957,7 +957,7 @@ async function handleAnthropicMessagesWithKey(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
-      allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
+      allowToolCall: (toolCall: CursorToolCall) => sdkAllowToolCall(prepared, toolCall)
     });
     return completion.stream;
   };
@@ -1027,7 +1027,7 @@ async function handleSdkRoute(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
-      allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
+      allowToolCall: (toolCall: CursorToolCall) => sdkAllowToolCall(prepared, toolCall)
     };
     logSdkPreCall(kind, prepared, attempt, completionInput);
     const completion = await createCursorSdkCompletion(env, deps, apiKey, completionInput);
@@ -1197,11 +1197,25 @@ function streamOpenAiEvents(
     let sawText = false;
     let sawToolCall = false;
     let sawDone = false;
+    let completed = false;
+    let wroteResponseCompleted = false;
+    let wroteUsage = false;
+    let wroteDoneMarker = false;
+    let clientWriteError = false;
+    let errorDetails: StreamErrorDetails | undefined;
+    const writeChunk = async (chunk: Uint8Array) => {
+      try {
+        await writer.write(chunk);
+      } catch (error) {
+        clientWriteError = true;
+        throw error;
+      }
+    };
     try {
       if (kind === "chat") {
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
+        await writeChunk(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
       } else {
-        for (const event of responseCreatedEvents({ ...input, nextSequence: nextResponseSequence })) await writer.write(event);
+        for (const event of responseCreatedEvents({ ...input, nextSequence: nextResponseSequence })) await writeChunk(event);
       }
 
       for await (const event of cursorEvents) {
@@ -1210,16 +1224,16 @@ function streamOpenAiEvents(
           sawText = true;
           text += event.text;
           if (kind === "chat") {
-            await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
+            await writeChunk(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
           } else {
             if (responseTextOutputIndex === null) {
               responseTextOutputIndex = responseNextOutputIndex;
               responseNextOutputIndex += 1;
               for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence })) {
-                await writer.write(chunk);
+                await writeChunk(chunk);
               }
             }
-            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence }));
+            await writeChunk(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence }));
           }
         }
         if (event.type === "tool_call") {
@@ -1235,12 +1249,12 @@ function streamOpenAiEvents(
           finishReason = "tool_calls";
           streamedToolCalls.push(toolCall);
           if (kind === "chat") {
-            await writer.write(
+            await writeChunk(
               chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } })
             );
           } else {
             for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex, nextSequence: nextResponseSequence })) {
-              await writer.write(chunk);
+              await writeChunk(chunk);
             }
             responseNextOutputIndex += 1;
           }
@@ -1254,9 +1268,9 @@ function streamOpenAiEvents(
 
       if (kind === "chat") {
         const completionChars = completionCharsFromOutput(text, streamedToolCalls);
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
+        await writeChunk(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
         if (input.includeUsage) {
-          await writer.write(
+          await writeChunk(
             chatUsageChunk({
               id: input.id,
               created: input.created,
@@ -1265,32 +1279,40 @@ function streamOpenAiEvents(
               completionChars
             })
           );
+          wroteUsage = true;
         }
-        await writer.write(doneChunk());
+        await writeChunk(doneChunk());
+        wroteDoneMarker = true;
       } else {
         if (responseTextOutputIndex === null && !streamedToolCalls.length) {
           responseTextOutputIndex = responseNextOutputIndex;
           responseNextOutputIndex += 1;
           for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex, nextSequence: nextResponseSequence })) {
-            await writer.write(chunk);
+            await writeChunk(chunk);
           }
         }
-        for (const event of responseDoneEvents({
+        const doneEvents = responseDoneEvents({
           ...input,
           text,
           toolCalls: streamedToolCalls,
           textStarted: responseTextOutputIndex !== null,
           textOutputIndex: responseTextOutputIndex ?? 0,
           nextSequence: nextResponseSequence
-        })) {
-          await writer.write(event);
+        });
+        for (const [index, event] of doneEvents.entries()) {
+          await writeChunk(event);
+          if (index === doneEvents.length - 1) {
+            wroteResponseCompleted = true;
+            wroteUsage = true;
+          }
         }
       }
+      completed = true;
       input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
     } catch (error) {
       await input.onError?.(error);
-      const details = streamErrorDetails(error);
-      logStreamError(kind, input, details, {
+      errorDetails = streamErrorDetails(error);
+      logStreamError(kind, input, errorDetails, {
         emittedResponseEvents: responseSequenceNumber,
         seenCursorEvent,
         sawText,
@@ -1300,12 +1322,29 @@ function streamOpenAiEvents(
       await writer
         .write(
           kind === "responses"
-            ? responseErrorEvent(details.message, nextResponseSequence(), details)
-            : encodeSse({ error: chatStreamErrorPayload(details) }, "error")
+            ? responseErrorEvent(errorDetails.message, nextResponseSequence(), errorDetails)
+            : encodeSse({ error: chatStreamErrorPayload(errorDetails) }, "error")
         )
-        .catch(() => undefined);
+        .catch(() => {
+          clientWriteError = true;
+        });
     } finally {
-      await writer.close().catch(() => undefined);
+      await writer.close().catch(() => {
+        clientWriteError = true;
+      });
+      logStreamTerminal(kind, input, {
+        completed,
+        clientWriteError,
+        emittedResponseEvents: responseSequenceNumber,
+        seenCursorEvent,
+        sawText,
+        sawToolCall,
+        sawDone,
+        wroteResponseCompleted,
+        wroteUsage,
+        wroteDoneMarker,
+        error: errorDetails
+      });
     }
   };
   void pump();
@@ -1365,6 +1404,49 @@ function logStreamError(
     errorCode: error.code,
     errorStatus: error.status,
     errorMessage: error.message
+  }));
+}
+
+function logStreamTerminal(
+  kind: "chat" | "responses",
+  input: StreamInput,
+  state: {
+    completed: boolean;
+    clientWriteError: boolean;
+    emittedResponseEvents: number;
+    seenCursorEvent: boolean;
+    sawText: boolean;
+    sawToolCall: boolean;
+    sawDone: boolean;
+    wroteResponseCompleted: boolean;
+    wroteUsage: boolean;
+    wroteDoneMarker: boolean;
+    error?: StreamErrorDetails;
+  }
+): void {
+  const log = input.streamLog;
+  console.info(JSON.stringify({
+    event: "cursor2api_stream_terminal",
+    surface: log?.surface || kind,
+    mode: log?.mode,
+    model: input.model,
+    responseIdPrefix: input.id.slice(0, 16),
+    toolCount: log?.toolCount ?? input.tools.length,
+    requiresLocalTool: log?.requiresLocalTool,
+    completed: state.completed,
+    clientWriteError: state.clientWriteError,
+    emittedResponseEvents: state.emittedResponseEvents,
+    seenCursorEvent: state.seenCursorEvent,
+    sawText: state.sawText,
+    sawToolCall: state.sawToolCall,
+    sawDone: state.sawDone,
+    wroteResponseCompleted: state.wroteResponseCompleted,
+    wroteUsage: state.wroteUsage,
+    wroteDoneMarker: state.wroteDoneMarker,
+    errorType: state.error?.type,
+    errorCode: state.error?.code,
+    errorStatus: state.error?.status,
+    errorName: state.error?.name
   }));
 }
 
