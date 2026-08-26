@@ -49,6 +49,7 @@ import {
   toolCallRetryHint,
   type OpenAiToolCall,
   type OpenAiToolSpec,
+  type ResponseErrorInfo,
   type ToolCallContext
 } from "../worker/openai";
 import { collectCursorOutput } from "../worker/cursor";
@@ -748,6 +749,12 @@ async function handleResponsesWithKey(
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
+      streamLog: {
+        surface: "responses",
+        mode: prepared.prompt.mode,
+        toolCount: prepared.tools.length,
+        requiresLocalTool: prepared.requiresLocalTool
+      },
       onError: onBillingError,
       onDone: (text, _completionChars, toolCalls) => {
         storeResponse(
@@ -1035,6 +1042,12 @@ async function handleSdkRoute(
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
+      streamLog: {
+        surface: kind,
+        mode: prepared.prompt.mode,
+        toolCount: prepared.tools.length,
+        requiresLocalTool: prepared.requiresLocalTool
+      },
       onError: onBillingError,
       onDone: (text, _completionChars, toolCalls) => {
         if (kind === "responses") {
@@ -1130,6 +1143,12 @@ interface StreamInput {
   metadata?: Record<string, unknown>;
   tools: OpenAiToolSpec[];
   context?: ToolCallContext;
+  streamLog?: {
+    surface: "chat" | "responses";
+    mode?: string;
+    toolCount: number;
+    requiresLocalTool: boolean;
+  };
   onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
   onError?: (error: unknown) => void | Promise<void>;
 }
@@ -1154,6 +1173,10 @@ function streamOpenAiEvents(
     let responseTextOutputIndex: number | null = null;
     let responseSequenceNumber = 0;
     const nextResponseSequence = () => responseSequenceNumber++;
+    let seenCursorEvent = false;
+    let sawText = false;
+    let sawToolCall = false;
+    let sawDone = false;
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
@@ -1162,7 +1185,9 @@ function streamOpenAiEvents(
       }
 
       for await (const event of cursorEvents) {
+        seenCursorEvent = true;
         if (event.type === "text" && event.text) {
+          sawText = true;
           text += event.text;
           if (kind === "chat") {
             await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
@@ -1178,6 +1203,7 @@ function streamOpenAiEvents(
           }
         }
         if (event.type === "tool_call") {
+          sawToolCall = true;
           const [toolCall] = toOpenAiToolCalls({
             toolCalls: [event.toolCall],
             tools: input.tools,
@@ -1201,6 +1227,7 @@ function streamOpenAiEvents(
           toolCallCount += 1;
         }
         if (event.type === "done") {
+          sawDone = true;
           text = event.finalText;
         }
       }
@@ -1242,12 +1269,19 @@ function streamOpenAiEvents(
       input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
     } catch (error) {
       await input.onError?.(error);
-      const message = error instanceof Error ? error.message : "Stream failed";
+      const details = streamErrorDetails(error);
+      logStreamError(kind, input, details, {
+        emittedResponseEvents: responseSequenceNumber,
+        seenCursorEvent,
+        sawText,
+        sawToolCall,
+        sawDone
+      });
       await writer
         .write(
           kind === "responses"
-            ? responseErrorEvent(message, nextResponseSequence())
-            : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
+            ? responseErrorEvent(details.message, nextResponseSequence(), details)
+            : encodeSse({ error: chatStreamErrorPayload(details) }, "error")
         )
         .catch(() => undefined);
     } finally {
@@ -1256,6 +1290,91 @@ function streamOpenAiEvents(
   };
   void pump();
   return sseResponse(readable);
+}
+
+interface StreamErrorDetails extends ResponseErrorInfo {
+  message: string;
+  type: string;
+  code: string;
+  name?: string;
+}
+
+function streamErrorDetails(error: unknown): StreamErrorDetails {
+  const record = isRecord(error) ? error : {};
+  const cause = isRecord(record.cause) ? record.cause : {};
+  const status = parseStatus(record.status) || parseStatus(cause.status);
+  const code = stringField(record, "code") || stringField(cause, "code") || (status && status >= 500 ? "cursor_stream_error" : "invalid_request_error");
+  return {
+    name: error instanceof Error ? error.name : undefined,
+    message: error instanceof Error ? error.message : stringField(record, "message") || stringField(cause, "message") || "Stream failed",
+    type: stringField(record, "type") || stringField(cause, "type") || "cursor_error",
+    code,
+    status: status || undefined,
+    param: stringField(record, "param") || null
+  };
+}
+
+function logStreamError(
+  kind: "chat" | "responses",
+  input: StreamInput,
+  error: StreamErrorDetails,
+  state: {
+    emittedResponseEvents: number;
+    seenCursorEvent: boolean;
+    sawText: boolean;
+    sawToolCall: boolean;
+    sawDone: boolean;
+  }
+): void {
+  const log = input.streamLog;
+  console.error(JSON.stringify({
+    event: "cursor2api_stream_error",
+    surface: log?.surface || kind,
+    mode: log?.mode,
+    model: input.model,
+    responseIdPrefix: input.id.slice(0, 16),
+    toolCount: log?.toolCount ?? input.tools.length,
+    requiresLocalTool: log?.requiresLocalTool,
+    emittedResponseEvents: state.emittedResponseEvents,
+    seenCursorEvent: state.seenCursorEvent,
+    sawText: state.sawText,
+    sawToolCall: state.sawToolCall,
+    sawDone: state.sawDone,
+    errorName: error.name,
+    errorType: error.type,
+    errorCode: error.code,
+    errorStatus: error.status,
+    errorMessage: error.message
+  }));
+}
+
+function chatStreamErrorPayload(error: StreamErrorDetails): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    message: error.message,
+    type: error.type,
+    code: error.code
+  };
+  if (Number.isInteger(error.status)) payload.status = error.status;
+  if (error.param) payload.param = error.param;
+  return payload;
+}
+
+function parseStatus(value: unknown): number {
+  if (Number.isInteger(value) && typeof value === "number" && value >= 100 && value <= 599) return value;
+  if (typeof value === "string" && /^\d{3}$/.test(value.trim())) {
+    const parsed = Number.parseInt(value, 10);
+    if (parsed >= 100 && parsed <= 599) return parsed;
+  }
+  return 0;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function staticContentType(filePath: string): string {

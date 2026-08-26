@@ -13,7 +13,11 @@ import {
 
 describe("OpenAI compatibility adapter", () => {
   it("encodes Responses stream failures as schema-valid error events", () => {
-    const event = new TextDecoder().decode(responseErrorEvent("Authentication error", 2));
+    const event = new TextDecoder().decode(responseErrorEvent("Authentication error", 2, {
+      type: "invalid_request_error",
+      code: "unauthorized",
+      status: 401
+    }));
     const data = JSON.parse(event.match(/^data: (.+)$/m)?.[1] ?? "{}");
 
     expect(event).toContain("event: error");
@@ -21,11 +25,24 @@ describe("OpenAI compatibility adapter", () => {
       type: "error",
       sequence_number: 2,
       error: {
-        type: "cursor_error",
-        code: "cursor_stream_error",
+        type: "invalid_request_error",
+        code: "unauthorized",
         message: "Authentication error",
-        param: null
+        param: null,
+        status: 401
       }
+    });
+  });
+
+  it("keeps the legacy Responses stream error shape when details are absent", () => {
+    const event = new TextDecoder().decode(responseErrorEvent("Stream failed", 3));
+    const data = JSON.parse(event.match(/^data: (.+)$/m)?.[1] ?? "{}");
+
+    expect(data.error).toEqual({
+      type: "cursor_error",
+      code: "cursor_stream_error",
+      message: "Stream failed",
+      param: null
     });
   });
 
@@ -1690,6 +1707,85 @@ describe("OpenAI compatibility adapter", () => {
         parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] }
       }
     ]);
+  });
+
+  it("compacts large Responses tool inventories while preserving executable schemas", () => {
+    const longParameterDescription = `Long parameter contract ${"p".repeat(700)}`;
+    const fullToolSpecs = Array.from({ length: 24 }, (_, index) => ({
+      name: `client_tool_${index}`,
+      description: `Client tool ${index} ${"d".repeat(600)}`,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          payload: { type: "string", description: longParameterDescription },
+          mode: {
+            type: "string",
+            enum: ["read", "write", "patch", "delete", "append", "inspect", "lint", "test", "build", "deploy"]
+          },
+          items: { type: "array", items: { type: "number", description: "Numeric item value." } }
+        },
+        required: ["payload"]
+      }
+    }));
+    const requestTools = fullToolSpecs.map((tool) => ({ type: "function", ...tool }));
+
+    expect(JSON.stringify(requestTools).length).toBeGreaterThan(16_000);
+
+    const prepared = prepareResponsesRequest(
+      {
+        model: "grok-4.6",
+        input: [{ role: "user", content: "inspect current repo briefly" }],
+        tools: requestTools
+      },
+      { id: "grok-4.6" }
+    );
+
+    expect(prepared.prompt.mode).toBe("agent");
+    expect(prepared.prompt.text).toContain("Tool schemas below are compact summaries");
+    expect(prepared.prompt.text).toContain('"arguments"');
+    expect(prepared.prompt.text).toContain('"name":"payload"');
+    expect(prepared.prompt.text).not.toContain(longParameterDescription);
+    expect(prepared.prompt.text.length).toBeLessThan(28_000);
+    expect(prepared.tools[0]).toEqual(fullToolSpecs[0]);
+    const metadataTools = prepared.responseMetadata.tools as unknown[];
+    expect(metadataTools[0]).toEqual({ type: "function", ...fullToolSpecs[0] });
+
+    const toolCalls = toOpenAiToolCalls({
+      responseId: "resp_large",
+      tools: prepared.tools,
+      toolCalls: [{ name: "client_tool_0", arguments: { payload: "ok", mode: "read" } }]
+    });
+    expect(toolCalls[0].function.name).toBe("client_tool_0");
+    expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({ payload: "ok", mode: "read" });
+  });
+
+  it("keeps small Responses tool inventories unchanged in the prompt", () => {
+    const parameterDescription = "Detailed small schema description that should remain in the prompt.";
+    const prepared = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        input: [{ role: "user", content: "find source files" }],
+        tools: [
+          {
+            type: "function",
+            name: "glob",
+            description: "Find files",
+            parameters: {
+              type: "object",
+              properties: {
+                pattern: { type: "string", description: parameterDescription }
+              },
+              required: ["pattern"]
+            }
+          }
+        ]
+      },
+      { id: "composer-2.5" }
+    );
+
+    expect(prepared.prompt.text).not.toContain("Tool schemas below are compact summaries");
+    expect(prepared.prompt.text).toContain(parameterDescription);
   });
 
   it("feeds Responses pi bash outputs back with SDK millisecond timeout arguments", () => {
