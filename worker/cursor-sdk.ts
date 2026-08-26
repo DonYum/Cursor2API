@@ -29,6 +29,14 @@ interface ClientToolSpec {
   parameters?: unknown;
 }
 
+interface CursorSdkPreCallDiagnosticsInput {
+  prompt: { text: string; images?: CursorImage[] };
+  model?: { id: string };
+  workingDirectory?: string;
+  clientTools?: ClientToolSpec[];
+  incrementalPrompt?: { text: string; images?: CursorImage[] };
+}
+
 type ToolCallDecision = boolean | string;
 
 interface ProtobufField {
@@ -232,8 +240,42 @@ export function resetCursorSdkSessionCacheForTest() {
   sdkSessions.clear();
 }
 
+export function cursorSdkPreCallDiagnostics(env: Env, input: CursorSdkPreCallDiagnosticsInput): Record<string, unknown> {
+  const prompt = sdkPrompt(input.prompt);
+  const incrementalPrompt = input.incrementalPrompt ? sdkPrompt(input.incrementalPrompt) : undefined;
+  const clientTools = normalizeBridgeClientTools(input.clientTools);
+  const bridgeTools = bridgeClientTools(input.clientTools);
+  return {
+    bridgeMode: cursorSdkBridgeMode(env),
+    modelId: input.model?.id || "composer-2.5",
+    promptChars: prompt.length,
+    promptBytes: utf8Bytes(prompt),
+    hasIncrementalPrompt: incrementalPrompt !== undefined,
+    ...(incrementalPrompt !== undefined
+      ? {
+          incrementalPromptChars: incrementalPrompt.length,
+          incrementalPromptBytes: utf8Bytes(incrementalPrompt)
+        }
+      : {}),
+    clientToolsCount: clientTools.length,
+    clientToolsBytes: utf8Bytes(JSON.stringify(clientTools)),
+    bridgeToolsBytes: utf8Bytes(JSON.stringify(bridgeTools)),
+    bridgeBodyBytesRedacted: utf8Bytes(JSON.stringify({
+      apiKey: "<redacted>",
+      requestId: "<redacted>",
+      model: input.model?.id || "composer-2.5",
+      prompt,
+      incrementalPrompt,
+      sessionKey: "<redacted>",
+      workingDirectory: sdkWorkingDirectory(input.workingDirectory),
+      tools: bridgeTools
+    }))
+  };
+}
+
 export const cursorSdkTestExports = {
   bridgeClientTools,
+  cursorSdkPreCallDiagnostics,
   decodeLocalAgentServerFrame,
   encodeAgentClientRequestContextResult,
   encodeAgentClientRunRequest,
@@ -699,8 +741,20 @@ function hasCursorSdkBridge(env: Env): boolean {
   return Boolean(env.CURSOR_SDK_BRIDGE_CONTAINER || env.CURSOR_SDK_BRIDGE_URL?.trim());
 }
 
+function cursorSdkBridgeMode(env: Env): "container" | "url" | "direct" {
+  if (env.CURSOR_SDK_BRIDGE_CONTAINER) return "container";
+  if (env.CURSOR_SDK_BRIDGE_URL?.trim()) return "url";
+  return "direct";
+}
+
 function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[] {
-  const normalized = (tools ?? []).flatMap((tool) => {
+  const normalized = normalizeBridgeClientTools(tools);
+  if (JSON.stringify(normalized).length <= BRIDGE_CLIENT_TOOLS_COMPACT_THRESHOLD) return normalized;
+  return normalized.map(compactBridgeClientTool);
+}
+
+function normalizeBridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[] {
+  return (tools ?? []).flatMap((tool) => {
     const name = typeof tool.name === "string" ? tool.name.trim() : "";
     if (!name) return [];
     return [{
@@ -709,8 +763,6 @@ function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[
       ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {})
     }];
   });
-  if (JSON.stringify(normalized).length <= BRIDGE_CLIENT_TOOLS_COMPACT_THRESHOLD) return normalized;
-  return normalized.map(compactBridgeClientTool);
 }
 
 function compactBridgeClientTool(tool: ClientToolSpec): ClientToolSpec {
@@ -768,6 +820,10 @@ function cursorLocalSdkBridgeHeaders(env: Env): Headers {
     headers.set("Authorization", `Bearer ${env.CURSOR_SDK_BRIDGE_TOKEN.trim()}`);
   }
   return headers;
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
 }
 
 async function writeSdkUpload(writer: WritableStreamDefaultWriter<Uint8Array>, frame: Uint8Array): Promise<void> {

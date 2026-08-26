@@ -56,6 +56,7 @@ import { collectCursorOutput } from "../worker/cursor";
 import {
   createCursorSdkCompletion,
   collectCursorSdkOutput,
+  cursorSdkPreCallDiagnostics,
   isTransientCursorSdkError
 } from "../worker/cursor-sdk";
 import { encodeSse } from "../worker/sse";
@@ -1017,7 +1018,7 @@ async function handleSdkRoute(
   // self-recovers instead of surfacing to the client.
   const baseSessionKey = sessionAffinity(request);
   const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
-    const completion = await createCursorSdkCompletion(env, deps, apiKey, {
+    const completionInput = {
       prompt: prepared.prompt,
       model: prepared.cursorModel,
       sessionKey: attempt === 0 ? baseSessionKey : `retry-${crypto.randomUUID()}`,
@@ -1027,7 +1028,9 @@ async function handleSdkRoute(
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
       allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
-    });
+    };
+    logSdkPreCall(kind, prepared, attempt, completionInput);
+    const completion = await createCursorSdkCompletion(env, deps, apiKey, completionInput);
     return completion.stream;
   };
   const stream = retryingSdkStream(makeStream);
@@ -1111,6 +1114,23 @@ function logToolForwarding(surface: string, prepared: PreparedRequest): void {
     toolCount: prepared.tools.length,
     toolNames: prepared.tools.map((tool) => tool.name),
     requiresLocalTool: prepared.requiresLocalTool
+  }));
+}
+
+function logSdkPreCall(
+  surface: "chat" | "responses",
+  prepared: PreparedRequest,
+  attempt: number,
+  input: Parameters<typeof createCursorSdkCompletion>[3]
+): void {
+  console.info(JSON.stringify({
+    event: "cursor2api_sdk_precall",
+    surface,
+    mode: prepared.prompt.mode,
+    model: prepared.model,
+    requiresLocalTool: prepared.requiresLocalTool,
+    attempt,
+    ...cursorSdkPreCallDiagnostics(env, input)
   }));
 }
 
