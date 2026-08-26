@@ -117,6 +117,8 @@ const AGENT_MODE_PRIMER = [
 const RESPONSES_TOOL_INVENTORY_COMPACT_THRESHOLD = 16_000;
 const COMPACT_TOOL_DESCRIPTION_LIMIT = 80;
 const COMPACT_PARAMETER_ENUM_LIMIT = 8;
+const RESPONSES_AGENT_PROMPT_MAX_BYTES = 800_000;
+const RESPONSES_AGENT_PROMPT_HEAD_BYTES = 64_000;
 
 export function prepareChatRequest(body: unknown, cursorModel: { id: string } | undefined, options: { forceAgentMode?: boolean } = {}): PreparedRequest {
   const record = expectRecord(body, "body");
@@ -276,9 +278,16 @@ export function prepareResponsesRequest(
   transcript.push("", "INPUT:");
   const effectiveInput = responseInputWithPrevious(record.input, options);
   const { text, images } = responseInputToTextAndImages(effectiveInput, tools);
-  transcript.push(text || "[empty]");
-  appendResponseOptions(transcript, record);
-  const prompt = transcript.join("\n");
+  const optionTranscript: string[] = [];
+  appendResponseOptions(optionTranscript, record);
+  const buildPrompt = (inputText: string) => [...transcript, inputText, ...optionTranscript].join("\n");
+  let inputText = text || "[empty]";
+  let prompt = buildPrompt(inputText);
+  if (tools.length && utf8Bytes(prompt) > RESPONSES_AGENT_PROMPT_MAX_BYTES) {
+    const emptyInputPromptBytes = utf8Bytes(buildPrompt(""));
+    inputText = truncateResponsesInputText(inputText, Math.max(0, RESPONSES_AGENT_PROMPT_MAX_BYTES - emptyInputPromptBytes));
+    prompt = buildPrompt(inputText);
+  }
   const previousResponseId = typeof record.previous_response_id === "string" && record.previous_response_id.trim()
     ? record.previous_response_id.trim()
     : undefined;
@@ -1179,6 +1188,49 @@ function compactParameterType(record: Record<string, unknown>): string {
 function truncateText(text: string, limit: number): string {
   if (text.length <= limit) return text;
   return `${text.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function truncateResponsesInputText(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const originalBytes = utf8Bytes(text);
+  if (originalBytes <= maxBytes) return text;
+  const notice = [
+    "",
+    `[Cursor2API truncated oversized Responses INPUT: original ${originalBytes} UTF-8 bytes; kept the beginning and most recent tail to fit the upstream bridge limit.]`,
+    ""
+  ].join("\n");
+  const noticeBytes = utf8Bytes(notice);
+  if (noticeBytes >= maxBytes) return utf8Prefix(notice, maxBytes);
+  const availableBytes = Math.max(0, maxBytes - noticeBytes);
+  const headBytes = Math.min(RESPONSES_AGENT_PROMPT_HEAD_BYTES, Math.floor(availableBytes * 0.2));
+  const tailBytes = Math.max(0, availableBytes - headBytes);
+  return `${utf8Prefix(text, headBytes)}${notice}${utf8Suffix(text, tailBytes)}`;
+}
+
+function utf8Prefix(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  return fitUtf8Bytes(new TextDecoder().decode(bytes.slice(0, maxBytes)), maxBytes, "end");
+}
+
+function utf8Suffix(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  return fitUtf8Bytes(new TextDecoder().decode(bytes.slice(bytes.byteLength - maxBytes)), maxBytes, "start");
+}
+
+function fitUtf8Bytes(text: string, maxBytes: number, trim: "start" | "end"): string {
+  let out = text;
+  while (utf8Bytes(out) > maxBytes) {
+    out = trim === "start" ? out.slice(1) : out.slice(0, -1);
+  }
+  return out;
+}
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
 }
 
 function directToolChoiceHint(toolName: string): string {
