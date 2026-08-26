@@ -59,7 +59,7 @@ import {
   cursorSdkPreCallDiagnostics,
   isTransientCursorSdkError
 } from "../worker/cursor-sdk";
-import { encodeSse } from "../worker/sse";
+import { encodeSse, encodeSseComment } from "../worker/sse";
 import type { CursorToolCall, Deps, Env } from "../worker/types";
 import {
   anthropicError,
@@ -77,6 +77,8 @@ import {
   parseCursorCredentialEnv
 } from "./router";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+
+const RESPONSES_SSE_KEEPALIVE_MS = 30_000;
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -1203,12 +1205,32 @@ function streamOpenAiEvents(
     let wroteDoneMarker = false;
     let clientWriteError = false;
     let errorDetails: StreamErrorDetails | undefined;
+    let keepaliveComments = 0;
+    let lastClientWriteAt = Date.now();
+    let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+    let keepaliveWriting = false;
     const writeChunk = async (chunk: Uint8Array) => {
       try {
         await writer.write(chunk);
+        lastClientWriteAt = Date.now();
       } catch (error) {
         clientWriteError = true;
         throw error;
+      }
+    };
+    const writeKeepalive = async () => {
+      if (keepaliveWriting || Date.now() - lastClientWriteAt < RESPONSES_SSE_KEEPALIVE_MS) return;
+      keepaliveWriting = true;
+      try {
+        await writer.write(encodeSseComment());
+        keepaliveComments += 1;
+        lastClientWriteAt = Date.now();
+      } catch {
+        clientWriteError = true;
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        keepaliveTimer = undefined;
+      } finally {
+        keepaliveWriting = false;
       }
     };
     try {
@@ -1216,6 +1238,9 @@ function streamOpenAiEvents(
         await writeChunk(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
       } else {
         for (const event of responseCreatedEvents({ ...input, nextSequence: nextResponseSequence })) await writeChunk(event);
+        keepaliveTimer = setInterval(() => {
+          void writeKeepalive();
+        }, RESPONSES_SSE_KEEPALIVE_MS);
       }
 
       for await (const event of cursorEvents) {
@@ -1329,6 +1354,7 @@ function streamOpenAiEvents(
           clientWriteError = true;
         });
     } finally {
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
       await writer.close().catch(() => {
         clientWriteError = true;
       });
@@ -1336,6 +1362,7 @@ function streamOpenAiEvents(
         completed,
         clientWriteError,
         emittedResponseEvents: responseSequenceNumber,
+        keepaliveComments,
         seenCursorEvent,
         sawText,
         sawToolCall,
@@ -1414,6 +1441,7 @@ function logStreamTerminal(
     completed: boolean;
     clientWriteError: boolean;
     emittedResponseEvents: number;
+    keepaliveComments: number;
     seenCursorEvent: boolean;
     sawText: boolean;
     sawToolCall: boolean;
@@ -1436,6 +1464,7 @@ function logStreamTerminal(
     completed: state.completed,
     clientWriteError: state.clientWriteError,
     emittedResponseEvents: state.emittedResponseEvents,
+    keepaliveComments: state.keepaliveComments,
     seenCursorEvent: state.seenCursorEvent,
     sawText: state.sawText,
     sawToolCall: state.sawToolCall,
