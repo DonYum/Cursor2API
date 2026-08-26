@@ -47,6 +47,93 @@ describe("Cursor SDK harness", () => {
     expect(fetchCalls).toBe(3);
   });
 
+  it("compacts large client tool schemas before sending them to the SDK bridge", async () => {
+    let bridgeBody = "";
+    const longParameterDescription = `Long parameter contract ${"p".repeat(700)}`;
+    const clientTools = Array.from({ length: 24 }, (_, index) => ({
+      name: `client_tool_${index}`,
+      description: `Client tool ${index} ${"d".repeat(600)}`,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          payload: { type: "string", description: longParameterDescription },
+          mode: {
+            type: "string",
+            enum: ["read", "write", "patch", "delete", "append", "inspect", "lint", "test", "build", "deploy"]
+          }
+        },
+        required: ["payload"]
+      }
+    }));
+    expect(JSON.stringify(clientTools).length).toBeGreaterThan(16_000);
+
+    const completion = await createCursorSdkCompletion(
+      {
+        CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk"
+      } as any,
+      {
+        now: () => new Date("2026-08-13T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_url, init) => {
+          bridgeBody = String(init?.body || "");
+          return new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      },
+      "cursor-test-key",
+      {
+        prompt: { text: "Inspect the repo" },
+        model: { id: "grok-4.6" },
+        sessionKey: "large-tools",
+        clientTools
+      }
+    );
+
+    await expect(collectCursorSdkOutput(completion.stream)).resolves.toMatchObject({ text: "OK" });
+    const parsed = JSON.parse(bridgeBody);
+    expect(parsed.tools).toHaveLength(24);
+    expect(JSON.stringify(parsed.tools).length).toBeLessThan(8_000);
+    expect(parsed.tools[0]).not.toHaveProperty("description");
+    expect(JSON.stringify(parsed.tools)).not.toContain(longParameterDescription);
+    expect(parsed.tools[0]).toMatchObject({
+      name: "client_tool_0",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          payload: { type: "string" },
+          mode: { type: "string", enum: ["read", "write", "patch", "delete", "append", "inspect", "lint", "test"] }
+        },
+        required: ["payload"]
+      }
+    });
+  });
+
+  it("keeps small client tool schemas unchanged for the SDK bridge", async () => {
+    const tools = cursorSdkTestExports.bridgeClientTools([{
+      name: "glob",
+      description: "Find files",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Detailed pattern description." }
+        },
+        required: ["pattern"]
+      }
+    }]);
+
+    expect(tools[0].parameters).toEqual({
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "Detailed pattern description." }
+      },
+      required: ["pattern"]
+    });
+  });
+
   it("does not emit incomplete SDK tool-call starts to OpenCode", () => {
     expect(cursorSdkTestExports.isEmittableSdkToolCall({ name: "glob", arguments: {} })).toBe(false);
     expect(cursorSdkTestExports.isEmittableSdkToolCall({ name: "edit", arguments: {} })).toBe(false);

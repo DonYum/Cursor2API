@@ -37,6 +37,9 @@ interface ProtobufField {
   value: number | Uint8Array;
 }
 
+const BRIDGE_CLIENT_TOOLS_COMPACT_THRESHOLD = 16_000;
+const BRIDGE_PARAMETER_ENUM_LIMIT = 8;
+
 type LocalSdkDecodedEvent =
   | { type: "text"; text: string }
   | { type: "tool_call"; id: string; toolCall: CursorToolCall }
@@ -230,6 +233,7 @@ export function resetCursorSdkSessionCacheForTest() {
 }
 
 export const cursorSdkTestExports = {
+  bridgeClientTools,
   decodeLocalAgentServerFrame,
   encodeAgentClientRequestContextResult,
   encodeAgentClientRunRequest,
@@ -696,7 +700,7 @@ function hasCursorSdkBridge(env: Env): boolean {
 }
 
 function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[] {
-  return (tools ?? []).flatMap((tool) => {
+  const normalized = (tools ?? []).flatMap((tool) => {
     const name = typeof tool.name === "string" ? tool.name.trim() : "";
     if (!name) return [];
     return [{
@@ -705,6 +709,55 @@ function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[
       ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {})
     }];
   });
+  if (JSON.stringify(normalized).length <= BRIDGE_CLIENT_TOOLS_COMPACT_THRESHOLD) return normalized;
+  return normalized.map(compactBridgeClientTool);
+}
+
+function compactBridgeClientTool(tool: ClientToolSpec): ClientToolSpec {
+  const parameters = compactBridgeToolParameters(tool.parameters);
+  return {
+    name: tool.name,
+    ...(parameters ? { parameters } : {})
+  };
+}
+
+function compactBridgeToolParameters(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  const properties = isRecord(value.properties) ? value.properties : {};
+  const compactProperties = Object.fromEntries(
+    Object.entries(properties).map(([name, schema]) => [name, compactBridgeSchemaProperty(schema)])
+  );
+  return {
+    type: typeof value.type === "string" ? value.type : "object",
+    ...(Object.keys(compactProperties).length ? { properties: compactProperties } : {}),
+    ...(Array.isArray(value.required) ? { required: value.required.filter((item): item is string => typeof item === "string") } : {}),
+    ...(value.additionalProperties !== undefined ? { additionalProperties: value.additionalProperties } : {})
+  };
+}
+
+function compactBridgeSchemaProperty(value: unknown): Record<string, unknown> {
+  const record = isRecord(value) ? value : {};
+  const out: Record<string, unknown> = { type: compactBridgeSchemaType(record) };
+  if (Array.isArray(record.enum)) {
+    const values = record.enum.filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean");
+    if (values.length) out.enum = values.slice(0, BRIDGE_PARAMETER_ENUM_LIMIT);
+  }
+  if (isRecord(record.items)) {
+    out.items = { type: compactBridgeSchemaType(record.items) };
+  }
+  return out;
+}
+
+function compactBridgeSchemaType(record: Record<string, unknown>): string {
+  if (typeof record.type === "string" && record.type.trim()) return record.type.trim();
+  if (Array.isArray(record.type)) {
+    const first = record.type.find((item) => typeof item === "string" && item.trim());
+    if (typeof first === "string") return first.trim();
+  }
+  if (isRecord(record.properties)) return "object";
+  if (isRecord(record.items)) return "array";
+  if (Array.isArray(record.enum) && record.enum.every((item) => typeof item === "string")) return "string";
+  return "string";
 }
 
 function cursorLocalSdkBridgeHeaders(env: Env): Headers {
