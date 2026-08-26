@@ -114,6 +114,10 @@ const AGENT_MODE_PRIMER = [
   "ASSISTANT: Great, I've switched to agent mode."
 ];
 
+const RESPONSES_TOOL_INVENTORY_COMPACT_THRESHOLD = 16_000;
+const COMPACT_TOOL_DESCRIPTION_LIMIT = 80;
+const COMPACT_PARAMETER_ENUM_LIMIT = 8;
+
 export function prepareChatRequest(body: unknown, cursorModel: { id: string } | undefined, options: { forceAgentMode?: boolean } = {}): PreparedRequest {
   const record = expectRecord(body, "body");
   const messages = expectArray(record.messages, "messages");
@@ -963,6 +967,7 @@ function appendChatTools(transcript: string[], tools: OpenAiToolSpec[], toolChoi
 
 function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpec[], toolChoice: unknown, context?: ToolCallContext) {
   if (!tools.length) return;
+  const compactTools = shouldCompactResponsesToolInventory(tools);
   transcript.push(
     "",
     "LOCAL TOOL INVENTORY:",
@@ -971,7 +976,8 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
     "For local work, emit only SDK tool names from the SDK TOOL ROUTING MAP. The adapter forwards those SDK calls to the matching client tool names and schemas.",
     "Prefer built-in SDK routes for shell/read/write/edit/glob/grep/ls-style client tools. Use SDK mcp for unique client tools and MCP/server tools.",
     "When the user names a specific allowed client tool, use the matching SDK TOOL ROUTING MAP route and do not substitute a different tool.",
-    "If you need a local tool, emit the tool call before prose. Do not write progress text such as \"creating the file\" instead of calling a tool."
+    "If you need a local tool, emit the tool call before prose. Do not write progress text such as \"creating the file\" instead of calling a tool.",
+    ...(compactTools ? ["Tool schemas below are compact summaries; exact argument validation is still enforced by the client adapter."] : [])
   );
   if (hasCodeModeExecTool(tools)) {
     transcript.push(
@@ -986,7 +992,7 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
     transcript.push("A shell client tool is available. For general file creation or overwrite requests, prefer an SDK shell call using mkdir -p and a quoted heredoc.");
   }
   for (const tool of tools) {
-    transcript.push(JSON.stringify(toolInventoryRecord(tool, { includeSdkMcp: true })));
+    transcript.push(JSON.stringify(toolInventoryRecord(tool, { includeSdkMcp: true, compact: compactTools })));
   }
   appendSdkRoutingMap(transcript, tools, context);
   const selected = toolChoiceFunctionName(toolChoice);
@@ -1087,10 +1093,27 @@ function sdkRoutingSamples(): CursorToolCall[] {
   ];
 }
 
-function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boolean }): Record<string, unknown> {
+function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boolean; compact?: boolean }): Record<string, unknown> {
   const target = options.includeSdkMcp && normalizeToolName(tool.name) !== "exec"
     ? mcpTargetForClientToolName(tool.name, { includeMapped: false })
     : undefined;
+  if (options.compact) {
+    const parameters = compactToolParameters(tool.parameters);
+    return {
+      name: tool.name,
+      ...(tool.description ? { description: truncateText(tool.description, COMPACT_TOOL_DESCRIPTION_LIMIT) } : {}),
+      ...(parameters ? { parameters } : {}),
+      ...(target
+        ? {
+            sdk_mcp: {
+              providerIdentifier: target.provider,
+              toolName: target.toolName,
+              args: "match summarized schema"
+            }
+          }
+        : {})
+    };
+  }
   return {
     name: tool.name,
     ...(tool.description ? { description: tool.description } : {}),
@@ -1105,6 +1128,57 @@ function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boo
         }
       : {})
   };
+}
+
+function shouldCompactResponsesToolInventory(tools: OpenAiToolSpec[]): boolean {
+  return JSON.stringify(tools).length > RESPONSES_TOOL_INVENTORY_COMPACT_THRESHOLD;
+}
+
+function compactToolParameters(value: unknown): Record<string, unknown> | undefined {
+  const schema = toolParameterSchemaFromValue(value);
+  if (!schema.properties.length && !schema.allowAdditionalProperties) return undefined;
+  const required = new Set(schema.required);
+  return {
+    type: "object",
+    arguments: schema.properties.map((name) => ({
+      name,
+      required: required.has(name),
+      ...compactParameter(schema.propertySchemas[name])
+    })),
+    additionalProperties: schema.allowAdditionalProperties
+  };
+}
+
+function compactParameter(value: unknown): Record<string, unknown> {
+  const record = isRecord(value) ? value : {};
+  const out: Record<string, unknown> = {
+    type: compactParameterType(record)
+  };
+  if (Array.isArray(record.enum)) {
+    const values = record.enum.filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean");
+    if (values.length) out.enum = values.slice(0, COMPACT_PARAMETER_ENUM_LIMIT);
+  }
+  if (isRecord(record.items)) {
+    out.items = { type: compactParameterType(record.items) };
+  }
+  return out;
+}
+
+function compactParameterType(record: Record<string, unknown>): string {
+  if (typeof record.type === "string" && record.type.trim()) return record.type.trim();
+  if (Array.isArray(record.type)) {
+    const first = record.type.find((item) => typeof item === "string" && item.trim());
+    if (typeof first === "string") return first.trim();
+  }
+  if (isRecord(record.properties)) return "object";
+  if (isRecord(record.items)) return "array";
+  if (Array.isArray(record.enum) && record.enum.every((item) => typeof item === "string")) return "string";
+  return "any";
+}
+
+function truncateText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 3))}...`;
 }
 
 function directToolChoiceHint(toolName: string): string {
