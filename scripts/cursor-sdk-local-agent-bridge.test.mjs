@@ -4,6 +4,8 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import {
   bridgePrompt,
+  bridgeHealthPayload,
+  bridgeRuntimeObservationPayload,
   bridgeStreamErrorLogPayload,
   clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
@@ -123,6 +125,77 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(JSON.stringify(payload)).not.toContain("crsr_secret");
     expect(JSON.stringify(payload)).not.toContain("private prompt");
     expect(JSON.stringify(payload)).not.toContain("secret command");
+  });
+
+  it("summarizes runtime state without logging key, prompt, or tool arguments", () => {
+    const input = {
+      requestId: "run_1234567890abcdef",
+      apiKey: "crsr_secret",
+      prompt: "private prompt",
+      incrementalPrompt: "private delta",
+      model: "grok-4.6",
+      requiresLocalTool: true,
+      clientTools: [{ name: "Bash", arguments: { command: "secret command" } }]
+    };
+
+    const payload = bridgeRuntimeObservationPayload(input, {
+      phase: "request_complete",
+      status: "success",
+      durationMs: 1234
+    }, 2000);
+
+    expect(payload).toMatchObject({
+      event: "cursor_sdk_bridge_runtime",
+      phase: "request_complete",
+      status: "success",
+      requestIdPrefix: "run_1234567890ab",
+      model: "grok-4.6",
+      toolCount: 1,
+      requiresLocalTool: true,
+      durationMs: 1234
+    });
+    expect(payload.runtime).toMatchObject({
+      agentCacheSize: expect.any(Number),
+      agentRunQueueSize: expect.any(Number),
+      activeRunCount: expect.any(Number),
+      activeClientToolCaptureKeys: expect.any(Number),
+      activeClientToolCaptureHandlers: expect.any(Number)
+    });
+    expect(payload.memory).toMatchObject({
+      rss: expect.any(Number),
+      heapUsed: expect.any(Number)
+    });
+    expect(JSON.stringify(payload)).not.toContain("crsr_secret");
+    expect(JSON.stringify(payload)).not.toContain("private prompt");
+    expect(JSON.stringify(payload)).not.toContain("private delta");
+    expect(JSON.stringify(payload)).not.toContain("secret command");
+  });
+
+  it("exposes bridge health with runtime counters and memory only", () => {
+    const payload = bridgeHealthPayload(2000);
+
+    expect(payload).toMatchObject({
+      ok: true,
+      agents: expect.any(Number),
+      runtime: {
+        agentCacheSize: expect.any(Number),
+        maxAgents: expect.any(Number),
+        agentMaxAgeMs: expect.any(Number),
+        oldestAgentAgeMs: expect.any(Number),
+        oldestAgentIdleMs: expect.any(Number),
+        agentRunQueueSize: expect.any(Number),
+        activeRunCount: expect.any(Number),
+        activeAgentKeyCount: expect.any(Number),
+        activeClientToolCaptureKeys: expect.any(Number),
+        activeClientToolCaptureHandlers: expect.any(Number),
+        forceNextRunAgentKeys: expect.any(Number),
+        runtimeAgeMs: expect.any(Number)
+      },
+      memory: {
+        rss: expect.any(Number),
+        heapUsed: expect.any(Number)
+      }
+    });
   });
 
   it("keeps public Composer aliases distinct before SDK model selection", () => {
