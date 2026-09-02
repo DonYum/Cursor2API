@@ -21,6 +21,9 @@ const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
 const agentRuntimeRefreshMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_AGENT_REFRESH_MS, 45 * 60 * 1000);
+const agentMaxAgeMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_AGENT_MAX_AGE_MS, 0);
+const runtimeObservationIntervalMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUNTIME_LOG_INTERVAL_MS, 60 * 1000);
+const maintenanceIntervalMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAINTENANCE_INTERVAL_MS, 60 * 1000);
 const defaultCwd = process.env.CURSOR_SDK_WORKING_DIRECTORY || process.cwd();
 const clientMcpServerName = "client";
 const clientMcpServerMode = "--client-mcp-server";
@@ -28,11 +31,23 @@ const clientToolCallbackPath = "/client-tool-call";
 
 const agentCache = new Map();
 const agentRunQueues = new Map();
+const activeAgentRunCounts = new Map();
 const activeClientToolCaptures = new Map();
 const forceNextRunAgentKeys = new Set();
+const runtimeCounters = {
+  requestsStarted: 0,
+  requestsCompleted: 0,
+  requestsFailed: 0,
+  agentsCreated: 0,
+  agentsReused: 0,
+  agentsEvicted: 0,
+  runtimeResets: 0
+};
 let server = null;
+let maintenanceTimer = null;
 let agentRuntimeStartedAt = Date.now();
 let activeRunCount = 0;
+let lastRuntimeObservationLoggedAt = 0;
 
 if (isMainModule()) {
   installBridgeProcessHandlers();
@@ -54,6 +69,8 @@ export {
   isForwardableSDKToolCall,
   isAuthenticationSDKError,
   isRetryableSDKRunError,
+  bridgeHealthPayload,
+  bridgeRuntimeObservationPayload,
   bridgeStreamErrorLogPayload,
   composerToolCallFromText,
   normalizeSDKToolCall,
@@ -69,6 +86,7 @@ export {
 
 function startServer() {
   if (server) return server;
+  startBridgeMaintenanceTimer();
   server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
       writeJson(response, openAiError(error), statusFromError(error));
@@ -84,7 +102,7 @@ async function handleRequest(request, response) {
   const url = new URL(request.url || "/", `http://${request.headers.host || `${host}:${port}`}`);
 
   if (request.method === "GET" && url.pathname === "/health") {
-    writeJson(response, { ok: true, agents: agentCache.size });
+    writeJson(response, bridgeHealthPayload());
     return;
   }
 
@@ -217,11 +235,23 @@ async function runLocalAgent(input, onEvent) {
   if (activeRunCount === 0 && Date.now() - agentRuntimeStartedAt >= agentRuntimeRefreshMs) {
     resetAgentRuntime("scheduled credential refresh");
   }
+  runtimeCounters.requestsStarted += 1;
   activeRunCount += 1;
+  const startedAt = Date.now();
+  let succeeded = false;
   try {
-    return await runExclusiveForAgent(input, () => runLocalAgentUnlocked(input, onEvent));
+    const result = await runExclusiveForAgent(input, () => runLocalAgentUnlocked(input, onEvent));
+    succeeded = true;
+    return result;
   } finally {
     activeRunCount = Math.max(0, activeRunCount - 1);
+    if (succeeded) runtimeCounters.requestsCompleted += 1;
+    else runtimeCounters.requestsFailed += 1;
+    maybeLogBridgeRuntimeObservation(input, {
+      phase: "request_complete",
+      status: succeeded ? "success" : "error",
+      durationMs: Date.now() - startedAt
+    });
   }
 }
 
@@ -284,7 +314,12 @@ async function runExclusiveForAgent(input, work) {
 
   try {
     await previous.catch(() => {});
-    return await work();
+    markAgentRunActive(cacheKey);
+    try {
+      return await work();
+    } finally {
+      unmarkAgentRunActive(cacheKey);
+    }
   } finally {
     release();
     if (agentRunQueues.get(cacheKey) === current) {
@@ -405,16 +440,19 @@ async function getAgent(input) {
   const cached = agentCache.get(cacheKey);
   if (cached) {
     cached.touchedAt = Date.now();
+    runtimeCounters.agentsReused += 1;
     return { agent: cached.agent, cacheKey, cached: true };
   }
 
   const agent = await Agent.create(localAgentCreateOptions(input));
-  agentCache.set(cacheKey, { agent, touchedAt: Date.now() });
+  const now = Date.now();
+  agentCache.set(cacheKey, { agent, createdAt: now, touchedAt: now });
+  runtimeCounters.agentsCreated += 1;
   evictAgents();
   return { agent, cacheKey, cached: false };
 }
 
-function evictAgent(cacheKey, agent) {
+function evictAgent(cacheKey, agent, reason = "manual") {
   const cached = agentCache.get(cacheKey);
   if (cached?.agent === agent) {
     agentCache.delete(cacheKey);
@@ -423,6 +461,8 @@ function evictAgent(cacheKey, agent) {
   try {
     agent.close();
   } catch {}
+  runtimeCounters.agentsEvicted += 1;
+  maybeLogBridgeRuntimeObservation(null, { phase: "agent_evict", reason, force: true });
 }
 
 function evictCachedAgent(input) {
@@ -436,6 +476,7 @@ function resetAgentRuntime(reason) {
   agentCache.clear();
   forceNextRunAgentKeys.clear();
   agentRuntimeStartedAt = Date.now();
+  runtimeCounters.runtimeResets += 1;
   for (const entry of cachedAgents) {
     try {
       entry.agent.close();
@@ -454,6 +495,16 @@ function registerActiveClientToolCapture(cacheKey, handler) {
     handlers.delete(handler);
     if (handlers.size === 0) activeClientToolCaptures.delete(cacheKey);
   };
+}
+
+function markAgentRunActive(cacheKey) {
+  activeAgentRunCounts.set(cacheKey, (activeAgentRunCounts.get(cacheKey) || 0) + 1);
+}
+
+function unmarkAgentRunActive(cacheKey) {
+  const count = activeAgentRunCounts.get(cacheKey) || 0;
+  if (count <= 1) activeAgentRunCounts.delete(cacheKey);
+  else activeAgentRunCounts.set(cacheKey, count - 1);
 }
 
 async function captureActiveClientToolCall(cacheKey, toolCall) {
@@ -2085,14 +2136,21 @@ function agentCacheKey(input) {
 }
 
 function evictAgents() {
+  const now = Date.now();
+  if (agentMaxAgeMs > 0) {
+    for (const [cacheKey, entry] of [...agentCache.entries()]) {
+      if (activeAgentRunCounts.has(cacheKey)) continue;
+      if ((entry.createdAt || entry.touchedAt) + agentMaxAgeMs <= now) {
+        evictAgent(cacheKey, entry.agent, "max_age");
+      }
+    }
+  }
   while (agentCache.size > maxAgents) {
-    const oldest = [...agentCache.entries()].sort((a, b) => a[1].touchedAt - b[1].touchedAt)[0];
+    const oldest = [...agentCache.entries()]
+      .filter(([cacheKey]) => !activeAgentRunCounts.has(cacheKey))
+      .sort((a, b) => a[1].touchedAt - b[1].touchedAt)[0];
     if (!oldest) return;
-    agentCache.delete(oldest[0]);
-    forceNextRunAgentKeys.delete(oldest[0]);
-    try {
-      oldest[1].agent.close();
-    } catch {}
+    evictAgent(oldest[0], oldest[1].agent, "max_agents");
   }
 }
 
@@ -2254,6 +2312,85 @@ function writeNdjson(response, body) {
     }
     throw error;
   }
+}
+
+function startBridgeMaintenanceTimer() {
+  if (maintenanceTimer || maintenanceIntervalMs <= 0) return;
+  maintenanceTimer = setInterval(() => {
+    evictAgents();
+    maybeLogBridgeRuntimeObservation(null, { phase: "maintenance" });
+  }, maintenanceIntervalMs);
+  maintenanceTimer.unref?.();
+}
+
+function stopBridgeMaintenanceTimer() {
+  if (!maintenanceTimer) return;
+  clearInterval(maintenanceTimer);
+  maintenanceTimer = null;
+}
+
+function maybeLogBridgeRuntimeObservation(input, state = {}) {
+  const now = Date.now();
+  if (state.force !== true && runtimeObservationIntervalMs > 0 && now - lastRuntimeObservationLoggedAt < runtimeObservationIntervalMs) return;
+  lastRuntimeObservationLoggedAt = now;
+  console.info(JSON.stringify(bridgeRuntimeObservationPayload(input, state, now)));
+}
+
+function bridgeHealthPayload(now = Date.now()) {
+  return {
+    ok: true,
+    agents: agentCache.size,
+    runtime: bridgeRuntimeState(now),
+    memory: process.memoryUsage()
+  };
+}
+
+function bridgeRuntimeObservationPayload(input, state = {}, now = Date.now()) {
+  return {
+    event: "cursor_sdk_bridge_runtime",
+    phase: typeof state.phase === "string" ? state.phase : "observe",
+    status: typeof state.status === "string" ? state.status : undefined,
+    reason: typeof state.reason === "string" ? state.reason : undefined,
+    requestIdPrefix: typeof input?.requestId === "string" ? input.requestId.slice(0, 16) : undefined,
+    model: typeof input?.model === "string" ? input.model : undefined,
+    toolCount: Array.isArray(input?.clientTools) ? input.clientTools.length : undefined,
+    requiresLocalTool: input?.requiresLocalTool === true ? true : undefined,
+    durationMs: Number.isInteger(state.durationMs) ? state.durationMs : undefined,
+    runtime: bridgeRuntimeState(now),
+    memory: process.memoryUsage(),
+    counters: { ...runtimeCounters }
+  };
+}
+
+function bridgeRuntimeState(now = Date.now()) {
+  const cacheAges = [...agentCache.values()]
+    .map((entry) => now - (entry.createdAt || entry.touchedAt))
+    .filter((age) => Number.isFinite(age) && age >= 0);
+  const touchedAges = [...agentCache.values()]
+    .map((entry) => now - entry.touchedAt)
+    .filter((age) => Number.isFinite(age) && age >= 0);
+  return {
+    agentCacheSize: agentCache.size,
+    maxAgents,
+    agentMaxAgeMs,
+    oldestAgentAgeMs: cacheAges.length ? Math.max(...cacheAges) : 0,
+    oldestAgentIdleMs: touchedAges.length ? Math.max(...touchedAges) : 0,
+    agentRunQueueSize: agentRunQueues.size,
+    activeRunCount,
+    activeAgentKeyCount: activeAgentRunCounts.size,
+    activeClientToolCaptureKeys: activeClientToolCaptures.size,
+    activeClientToolCaptureHandlers: activeClientToolCaptureHandlerCount(),
+    forceNextRunAgentKeys: forceNextRunAgentKeys.size,
+    runtimeAgeMs: now - agentRuntimeStartedAt
+  };
+}
+
+function activeClientToolCaptureHandlerCount() {
+  let count = 0;
+  for (const handlers of activeClientToolCaptures.values()) {
+    count += handlers.size;
+  }
+  return count;
 }
 
 function installBridgeProcessHandlers() {
@@ -2526,6 +2663,7 @@ function loadEnvFile(filePath) {
 }
 
 async function closeAndExit(code) {
+  stopBridgeMaintenanceTimer();
   for (const entry of agentCache.values()) {
     try {
       entry.agent.close();
